@@ -24,9 +24,9 @@ include ${BUILDDIR}/config.mak
 
 PROG=${BUILDDIR}/tvheadend
 
-CFLAGS  = -Wall -Werror -Wwrite-strings -Wno-deprecated-declarations 
+CFLAGS  = -Wall -Werror -Wwrite-strings -Wno-deprecated-declarations -I/usr/local/include
 CFLAGS += -Wmissing-prototypes
-LDFLAGS += -lrt -ldl
+LDFLAGS += -lrt -liconv -L/usr/local/lib
 
 #
 # Core
@@ -179,7 +179,7 @@ ${BUILDDIR}/%.o: %.c
 	$(CC) -MD $(CFLAGS_com) $(CFLAGS) $(CFLAGS_cfg) -c -o $@ $(CURDIR)/$<
 
 ${BUILDDIR}/%.so: ${SRCS_EXTRA}
-	${CC} -O -fbuiltin -fomit-frame-pointer -fPIC -shared -o $@ $< -ldl
+	${CC} -O -fbuiltin -fomit-frame-pointer -fPIC -shared -I/usr/local/include -o $@ $< -ldl
 
 clean:
 	rm -rf ${BUILDDIR}/src ${BUILDDIR}/bundles ${BUILDDIR}/ver
