@@ -37,6 +37,7 @@ char tvh_binshasum[20];
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <dlfcn.h>
 
 #include "tvhead.h"
 #include "sha1.h"
@@ -62,9 +63,9 @@ sappend(char *buf, size_t l, const char *fmt, ...)
 static void 
 traphandler(int sig, siginfo_t *si, void *UC)
 {
-  ucontext_t *uc = UC;
+  /* ucontext_t *uc = UC; */
   static void *frames[MAXFRAMES];
-  int nframes = backtrace(frames, MAXFRAMES);
+  int nframes = 0; /* backtrace(frames, MAXFRAMES); */
   Dl_info dli;
   int i;
   const char *reason = NULL;
@@ -90,6 +91,7 @@ traphandler(int sig, siginfo_t *si, void *UC)
 	       si->si_addr, reason ?: "N/A");
 
   tvhlog_spawn(LOG_ALERT, "CRASH", "Loaded libraries: %s ", libs);
+#if 0
   snprintf(tmpbuf, sizeof(tmpbuf), "Register dump [%d]: ", NGREG);
 
   for(i = 0; i < NGREG; i++) {
@@ -99,6 +101,7 @@ traphandler(int sig, siginfo_t *si, void *UC)
     sappend(tmpbuf, sizeof(tmpbuf), "%08x ", uc->uc_mcontext.gregs[i]);
 #endif
   }
+#endif
   tvhlog_spawn(LOG_ALERT, "CRASH", "%s", tmpbuf);
 
   tvhlog_spawn(LOG_ALERT, "CRASH", "STACKTRACE");
