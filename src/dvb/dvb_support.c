@@ -154,7 +154,7 @@ dvb_get_string(char *dst, size_t dstlen, const uint8_t *src, size_t srclen)
   in = (char *)tmp;
 
   while(inlen > 0) {
-    r = iconv(ic, &in, &inlen, &out, &outlen);
+    r = iconv(ic, (const char **)&in, &inlen, &out, &outlen);
 
     if(r == (size_t) -1) {
       if(errno == EILSEQ) {
