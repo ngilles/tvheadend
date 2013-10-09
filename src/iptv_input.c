@@ -31,7 +31,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
-#include <linux/netdevice.h>
+#include <net/if.h>
 
 #include "tvhead.h"
 #include "htsmsg.h"
@@ -243,9 +243,9 @@ iptv_transport_start(th_transport_t *t, unsigned int weight, int force_start)
     memset(&m, 0, sizeof(m));
     m.imr_multiaddr.s_addr = t->tht_iptv_group.s_addr;
     m.imr_address.s_addr = 0;
-    m.imr_ifindex = ifr.ifr_ifindex;
+    m.imr_ifindex = ifr.ifr_index;
 
-      if(setsockopt(fd, SOL_IP, IP_ADD_MEMBERSHIP, &m,
+      if(setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m,
                 sizeof(struct ip_mreqn)) == -1) {
       tvhlog(LOG_ERR, "IPTV", "\"%s\" cannot join %s -- %s",
            t->tht_identifier, inet_ntoa(m.imr_multiaddr), strerror(errno));
@@ -269,9 +269,9 @@ iptv_transport_start(th_transport_t *t, unsigned int weight, int force_start)
     /* Join IPv6 group */
     memset(&m6, 0, sizeof(m6));
     m6.ipv6mr_multiaddr = t->tht_iptv_group6;
-    m6.ipv6mr_interface = ifr.ifr_ifindex;
+    m6.ipv6mr_interface = ifr.ifr_index;
 
-    if(setsockopt(fd, SOL_IPV6, IPV6_ADD_MEMBERSHIP, &m6,
+    if(setsockopt(fd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &m6,
                 sizeof(struct ipv6_mreq)) == -1) {
       inet_ntop(AF_INET6, m6.ipv6mr_multiaddr.s6_addr,
 		straddr, sizeof(straddr));
@@ -348,9 +348,9 @@ iptv_transport_stop(th_transport_t *t)
     /* Leave multicast group */
     m.imr_multiaddr.s_addr = t->tht_iptv_group.s_addr;
     m.imr_address.s_addr = 0;
-    m.imr_ifindex = ifr.ifr_ifindex;
+    m.imr_ifindex = ifr.ifr_index;
     
-    if(setsockopt(t->tht_iptv_fd, SOL_IP, IP_DROP_MEMBERSHIP, &m,
+    if(setsockopt(t->tht_iptv_fd, IPPROTO_IP, IP_DROP_MEMBERSHIP, &m,
 		  sizeof(struct ip_mreqn)) == -1) {
       tvhlog(LOG_ERR, "IPTV", "\"%s\" cannot leave %s -- %s",
 	     t->tht_identifier, inet_ntoa(m.imr_multiaddr), strerror(errno));
@@ -362,9 +362,9 @@ iptv_transport_stop(th_transport_t *t)
     memset(&m6, 0, sizeof(m6));
 
     m6.ipv6mr_multiaddr = t->tht_iptv_group6;
-    m6.ipv6mr_interface = ifr.ifr_ifindex;
+    m6.ipv6mr_interface = ifr.ifr_index;
 
-    if(setsockopt(t->tht_iptv_fd, SOL_IPV6, IPV6_DROP_MEMBERSHIP, &m6,
+    if(setsockopt(t->tht_iptv_fd, IPPROTO_IPV6, IPV6_LEAVE_GROUP, &m6,
 		  sizeof(struct ipv6_mreq)) == -1) {
       inet_ntop(AF_INET6, m6.ipv6mr_multiaddr.s6_addr,
 		straddr, sizeof(straddr));
@@ -406,7 +406,7 @@ iptv_transport_save(th_transport_t *t)
     inet_ntop(AF_INET, &t->tht_iptv_group, abuf, sizeof(abuf));
     htsmsg_add_str(m, "group", abuf);
   }
-  if(IN6_IS_ADDR_MULTICAST(t->tht_iptv_group6.s6_addr) ) {
+  if(IN6_IS_ADDR_MULTICAST(&t->tht_iptv_group6) ) {
     inet_ntop(AF_INET6, &t->tht_iptv_group6, abuf6, sizeof(abuf6));
     htsmsg_add_str(m, "group", abuf6);
   }
