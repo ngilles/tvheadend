@@ -27,7 +27,8 @@
 #include <string.h>
 
 #include <sys/stat.h>
-#include <sys/sendfile.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
 
 #include "tvhead.h"
 #include "access.h"
@@ -116,7 +117,7 @@ page_static_file(http_connection_t *hc, const char *remain, void *opaque)
   }
 
   http_send_header(hc, 200, content, st.st_size, NULL, NULL, 10, 0);
-  sendfile(hc->hc_fd, fd, NULL, st.st_size);
+  sendfile(fd, hc->hc_fd, 0, st.st_size, NULL, NULL, 0);
   close(fd);
   return 0;
 }
@@ -474,7 +475,7 @@ page_dvrfile(http_connection_t *hc, const char *remain, void *opaque)
     lseek(fd, file_start, SEEK_SET);
 
   http_send_header(hc, 200, content, content_len, NULL, NULL, 10, range_buf);
-  sendfile(hc->hc_fd, fd, NULL, content_len);
+  sendfile(fd, hc->hc_fd, 0, content_len, NULL, NULL, 0);
   close(fd);
 
   if(range)
