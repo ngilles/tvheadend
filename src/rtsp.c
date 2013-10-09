@@ -28,6 +28,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
 
 #include "tvhead.h"
 #include "channels.h"
