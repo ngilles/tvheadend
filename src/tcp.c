@@ -18,7 +18,9 @@
 
 #include <pthread.h>
 #include <netdb.h>
-#include <sys/epoll.h>
+#include <sys/types.h>
+#include <sys/event.h>
+#include <sys/time.h>
 #include <poll.h>
 #include <assert.h>
 #include <stdio.h>
@@ -347,7 +349,7 @@ tcp_read_timeout(int fd, void *buf, size_t len, int timeout)
 /**
  *
  */
-static int tcp_server_epoll_fd;
+static int tcp_server_kq;
 
 typedef struct tcp_server {
   tcp_server_callback_t *start;
@@ -409,7 +411,7 @@ static void *
 tcp_server_loop(void *aux)
 {
   int r, i;
-  struct epoll_event ev[1];
+  struct kevent ev[1];
   tcp_server_t *ts;
   tcp_server_launch_t *tsl;
   pthread_attr_t attr;
@@ -420,22 +422,22 @@ tcp_server_loop(void *aux)
   pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
   while(1) {
-    r = epoll_wait(tcp_server_epoll_fd, ev, sizeof(ev) / sizeof(ev[0]), -1);
+    r = kevent(tcp_server_kq, NULL, 0, ev, sizeof(ev) / sizeof(ev[0]), NULL);
     if(r == -1) {
       perror("tcp_server: epoll_wait");
       continue;
     }
 
     for(i = 0; i < r; i++) {
-      ts = ev[i].data.ptr;
+      ts = ev[i].udata;
 
-      if(ev[i].events & EPOLLHUP) {
+      if ((ev[i].filter & EVFILT_READ) && (ev[i].flags & EV_EOF)) {
 	close(ts->serverfd);
 	free(ts);
 	continue;
       }
 
-      if(ev[i].events & EPOLLIN) {
+      if(ev[i].filter & EVFILT_READ) {
 	tsl = malloc(sizeof(tcp_server_launch_t));
 	tsl->start  = ts->start;
 	tsl->opaque = ts->opaque;
@@ -472,7 +474,7 @@ void *
 tcp_server_create(int port, tcp_server_callback_t *start, void *opaque)
 {
   int fd, x;
-  struct epoll_event e;
+  struct kevent e;
   tcp_server_t *ts;
   struct sockaddr_in s;
   int one = 1;
@@ -501,10 +503,9 @@ tcp_server_create(int port, tcp_server_callback_t *start, void *opaque)
   ts->opaque = opaque;
 
   
-  e.events = EPOLLIN;
-  e.data.ptr = ts;
+  EV_SET(&e, fd, EVFILT_READ, EV_ADD, 0, 0, ts);
+  kevent(tcp_server_kq, &e, 1, NULL, 0, NULL);
 
-  epoll_ctl(tcp_server_epoll_fd, EPOLL_CTL_ADD, fd, &e);
   return ts;
 }
 
@@ -516,7 +517,7 @@ tcp_server_init(void)
 {
   pthread_t tid;
 
-  tcp_server_epoll_fd = epoll_create(10);
+  tcp_server_kq = kqueue();
   pthread_create(&tid, NULL, tcp_server_loop, NULL);
 }
 
