@@ -169,7 +169,7 @@ all: ${PROG}
 
 .PHONY:	clean distclean
 
-${PROG}: $(OBJDIRS) $(OBJS) $(BUNDLE_OBJS) ${OBJS_EXTRA} Makefile
+${PROG}: $(OBJDIRS) $(OBJS) $(BUNDLE_OBJS) Makefile
 	$(CC) -o $@ $(OBJS) $(BUNDLE_OBJS) $(LDFLAGS) ${LDFLAGS_cfg}
 
 $(OBJDIRS):
