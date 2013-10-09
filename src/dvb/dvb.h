@@ -157,7 +157,7 @@ typedef struct th_dvb_adapter {
 
   th_dvb_mux_instance_t *tda_mux_current;
 
-  int tda_table_epollfd;
+  int tda_table_kq;
 
   const char *tda_rootpath;
   char *tda_identifier;

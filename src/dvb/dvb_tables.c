@@ -19,9 +19,10 @@
 #include <pthread.h>
 
 #include <sys/types.h>
+#include <sys/event.h>
+#include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
-#include <sys/epoll.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <stdio.h>
@@ -140,7 +141,7 @@ static void
 tdt_open_fd(th_dvb_mux_instance_t *tdmi, th_dvb_table_t *tdt)
 {
   th_dvb_adapter_t *tda = tdmi->tdmi_adapter;
-  struct epoll_event e;
+  struct kevent e;
   
   assert(tdt->tdt_fd == -1);
   TAILQ_REMOVE(&tdmi->tdmi_table_queue, tdt, tdt_pending_link);
@@ -151,10 +152,11 @@ tdt_open_fd(th_dvb_mux_instance_t *tdmi, th_dvb_table_t *tdt)
 
     tdt->tdt_id = ++tdt_id_tally;
 
-    e.events = EPOLLIN;
-    e.data.u64 = ((uint64_t)tdt->tdt_fd << 32) | tdt->tdt_id;
+    /* WARNING: ASSUMING 64-BIT ARCH WITH 64-BIT POINTERS! WE SHOULD ALLOCATE MEMORY AND DO THIS CLEANLY */
+    EV_SET(&e, tdt->tdt_fd, EVFILT_READ, EV_ADD, 0, 0, (void*)(((uint64_t)tdt->tdt_fd << 32) | (uint64_t)tdt->tdt_id));
 
-    if(epoll_ctl(tda->tda_table_epollfd, EPOLL_CTL_ADD, tdt->tdt_fd, &e)) {
+    if (kevent(tda->tda_table_kq, &e, 1, NULL, 0, NULL)) {
+      printf("kevent(EV_ADD): errno = %d: %s\n", errno, strerror(errno));
       close(tdt->tdt_fd);
       tdt->tdt_fd = -1;
     } else {
@@ -176,11 +178,9 @@ tdt_open_fd(th_dvb_mux_instance_t *tdmi, th_dvb_table_t *tdt)
 static void
 tdt_close_fd(th_dvb_mux_instance_t *tdmi, th_dvb_table_t *tdt)
 {
-  th_dvb_adapter_t *tda = tdmi->tdmi_adapter;
-
   assert(tdt->tdt_fd != -1);
 
-  epoll_ctl(tda->tda_table_epollfd, EPOLL_CTL_DEL, tdt->tdt_fd, NULL);
+  /* closing the fd removes it from the kqueue automatically */
   close(tdt->tdt_fd);
 
   tdt->tdt_fd = -1;
@@ -235,21 +235,22 @@ dvb_table_input(void *aux)
 {
   th_dvb_adapter_t *tda = aux;
   int r, i, tid, fd, x;
-  struct epoll_event ev[1];
+  struct kevent ev[1];
   uint8_t sec[4096];
   th_dvb_mux_instance_t *tdmi;
   th_dvb_table_t *tdt;
   int64_t cycle_barrier = 0; 
 
   while(1) {
-    x = epoll_wait(tda->tda_table_epollfd, ev, sizeof(ev) / sizeof(ev[0]), -1);
+    x = kevent(tda->tda_table_kq, NULL, 0, ev, sizeof(ev) / sizeof(ev[0]), NULL);
 
     for(i = 0; i < x; i++) {
     
-      tid = ev[i].data.u64 & 0xffffffff;
-      fd  = ev[i].data.u64 >> 32; 
+      /* WARNING: ASSUMING 64BIT POINTERS */
+      tid = (uint64_t)ev[i].udata & 0xffffffff;
+      fd  = (uint64_t)ev[i].udata >> 32; 
 
-      if(!(ev[i].events & EPOLLIN))
+      if(!(ev[i].filter & EVFILT_READ))
 	continue;
 
       if((r = read(fd, sec, sizeof(sec))) < 3)
@@ -291,7 +292,7 @@ void
 dvb_table_init(th_dvb_adapter_t *tda)
 {
   pthread_t ptid;
-  tda->tda_table_epollfd = epoll_create(50);
+  tda->tda_table_kq = kqueue();
   pthread_create(&ptid, NULL, dvb_table_input, tda);
 }
 
@@ -308,7 +309,7 @@ dvb_tdt_destroy(th_dvb_adapter_t *tda, th_dvb_mux_instance_t *tdmi,
   if(tdt->tdt_fd == -1) {
     TAILQ_REMOVE(&tdmi->tdmi_table_queue, tdt, tdt_pending_link);
   } else {
-    epoll_ctl(tda->tda_table_epollfd, EPOLL_CTL_DEL, tdt->tdt_fd, NULL);
+    /* closing the fd should remove it from the kqueue automatically */
     close(tdt->tdt_fd);
   }
 
