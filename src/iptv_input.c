@@ -19,8 +19,9 @@
 #include <pthread.h>
 
 #include <sys/types.h>
+#include <sys/event.h>
+#include <sys/time.h>
 #include <sys/ioctl.h>
-#include <sys/epoll.h>
 #include <fcntl.h>
 #include <assert.h>
 
@@ -43,7 +44,7 @@
 #include "settings.h"
 
 static int iptv_thread_running;
-static int iptv_epollfd;
+static int iptv_kq;
 static pthread_mutex_t iptv_recvmutex;
 
 struct th_transport_list iptv_all_transports; /* All IPTV transports */
@@ -122,11 +123,11 @@ iptv_thread(void *aux)
 {
   int nfds, fd, r, j;
   uint8_t tsb[65536], *buf;
-  struct epoll_event ev;
+  struct kevent ev;
   th_transport_t *t;
 
   while(1) {
-    nfds = epoll_wait(iptv_epollfd, &ev, 1, -1);
+    nfds = kevent(iptv_kq, NULL, 0, &ev, 1, NULL);
     if(nfds == -1) {
       tvhlog(LOG_ERR, "IPTV", "epoll() error -- %s, sleeping 1 second",
 	     strerror(errno));
@@ -137,7 +138,7 @@ iptv_thread(void *aux)
     if(nfds < 1)
       continue;
 
-    fd = ev.data.fd;
+    fd = ev.ident;
     r = read(fd, tsb, sizeof(tsb));
 
     if(r > 1 && tsb[0] == 0x47 && (r % 188) == 0) {
@@ -192,13 +193,13 @@ iptv_transport_start(th_transport_t *t, unsigned int weight, int force_start)
   struct sockaddr_in sin;
   struct sockaddr_in6 sin6;
   struct ifreq ifr;
-  struct epoll_event ev;
+  struct kevent ev;
 
   assert(t->tht_iptv_fd == -1);
 
   if(iptv_thread_running == 0) {
     iptv_thread_running = 1;
-    iptv_epollfd = epoll_create(10);
+    iptv_kq = kqueue();
     pthread_create(&tid, NULL, iptv_thread, NULL);
   }
 
@@ -290,9 +291,8 @@ iptv_transport_start(th_transport_t *t, unsigned int weight, int force_start)
 	   resize, strerror(errno));
 
   memset(&ev, 0, sizeof(ev));
-  ev.events = EPOLLIN;
-  ev.data.fd = fd;
-  if(epoll_ctl(iptv_epollfd, EPOLL_CTL_ADD, fd, &ev) == -1) {
+  EV_SET(&ev, fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+  if (kevent(iptv_kq, &ev, 1, NULL, 0, NULL) == -1) {
     tvhlog(LOG_ERR, "IPTV", "\"%s\" cannot add to epoll set -- %s", 
 	   t->tht_identifier, strerror(errno));
     close(fd);
