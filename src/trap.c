@@ -15,7 +15,7 @@
  *  You should have received a copy of the GNU General Public License
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
+#include "config.h"
 #include "trap.h"
 
 char tvh_binshasum[20];
@@ -30,7 +30,10 @@ char tvh_binshasum[20];
 #include <string.h>
 #include <signal.h>
 #include <ucontext.h>
+#include <limits.h>
+#if ENABLE_EXECINFO
 #include <execinfo.h>
+#endif
 #include <stdio.h>
 #include <stdarg.h>
 
@@ -39,14 +42,16 @@ char tvh_binshasum[20];
 #include <fcntl.h>
 #include <dlfcn.h>
 
-#include "tvhead.h"
-#include "sha1.h"
+#include <openssl/sha.h>
+
+#include "tvheadend.h"
 
 #define MAXFRAMES 100
 
 static char line1[200];
 static char tmpbuf[1024];
 static char libs[1024];
+static char self[PATH_MAX];
 
 static void
 sappend(char *buf, size_t l, const char *fmt, ...)
@@ -59,15 +64,84 @@ sappend(char *buf, size_t l, const char *fmt, ...)
 }
 
 
+#ifdef ENABLE_EXECINFO
+
+/**
+ *
+ */
+static int
+add2lineresolve(const char *binary, void *addr, char *buf0, size_t buflen)
+{
+  char *buf = buf0;
+  int fd[2], r, f;
+  const char *argv[5];
+  pid_t p;
+  char addrstr[30], *cp;
+
+  argv[0] = "addr2line";
+  argv[1] = "-e";
+  argv[2] = binary;
+  argv[3] = addrstr;
+  argv[4] = NULL;
+
+  snprintf(addrstr, sizeof(addrstr), "%p", (void *)((intptr_t)addr-1));
+
+  if(pipe(fd) == -1)
+    return -1;
+
+  if((p = fork()) == -1)
+    return -1;
+
+  if(p == 0) {
+    close(0);
+    close(2);
+    close(fd[0]);
+    dup2(fd[1], 1);
+    close(fd[1]);
+    if((f = open("/dev/null", O_RDWR)) == -1)
+      exit(1);
+
+    dup2(f, 0);
+    dup2(f, 2);
+    close(f);
+
+    execve("/usr/bin/addr2line", (char *const *) argv, environ);
+    exit(2);
+  }
+
+  close(fd[1]);
+  *buf = 0;
+  while(buflen > 1) {
+    r = read(fd[0], buf, buflen);
+    if(r < 1)
+      break;
+
+    buf += r;
+    buflen -= r;
+    *buf = 0;
+    cp = strchr(buf0, '\n');
+    if(cp != NULL) {
+      *cp = 0;
+      break;
+    }
+  }
+  close(fd[0]);
+  return 0;
+}
+
+#endif
+
 
 static void 
 traphandler(int sig, siginfo_t *si, void *UC)
 {
   /* ucontext_t *uc = UC; */
+#if ENABLE_EXECINFO
+  char buf[200];
   static void *frames[MAXFRAMES];
   int nframes = 0; /* backtrace(frames, MAXFRAMES); */
   Dl_info dli;
-  int i;
+#endif
   const char *reason = NULL;
 
   tvhlog_spawn(LOG_ALERT, "CRASH", "Signal: %d in %s ", sig, line1);
@@ -94,6 +168,7 @@ traphandler(int sig, siginfo_t *si, void *UC)
 #if 0
   snprintf(tmpbuf, sizeof(tmpbuf), "Register dump [%d]: ", NGREG);
 
+  int i;
   for(i = 0; i < NGREG; i++) {
 #if __WORDSIZE == 64
     sappend(tmpbuf, sizeof(tmpbuf), "%016llx ", uc->uc_mcontext.gregs[i]);
@@ -104,6 +179,7 @@ traphandler(int sig, siginfo_t *si, void *UC)
 #endif
   tvhlog_spawn(LOG_ALERT, "CRASH", "%s", tmpbuf);
 
+#if ENABLE_EXECINFO
   tvhlog_spawn(LOG_ALERT, "CRASH", "STACKTRACE");
 
   for(i = 0; i < nframes; i++) {
@@ -119,6 +195,11 @@ traphandler(int sig, siginfo_t *si, void *UC)
 	continue;
       }
 
+      if(self[0] && !add2lineresolve(self, frames[i], buf, sizeof(buf))) {
+	tvhlog_spawn(LOG_ALERT, "CRASH", "%s %p", buf, frames[i]);
+	continue;
+      }
+
       if(dli.dli_fname != NULL && dli.dli_fbase != NULL) {
       	tvhlog_spawn(LOG_ALERT, "CRASH", "%s %p",
  		     dli.dli_fname,
@@ -130,6 +211,7 @@ traphandler(int sig, siginfo_t *si, void *UC)
       tvhlog_spawn(LOG_ALERT, "CRASH", "%p", frames[i]);
     }
   }
+#endif
 }
 
 
@@ -143,19 +225,22 @@ callback(struct dl_phdr_info *info, size_t size, void *data)
 }
 
 
-extern const char *htsversion_full;
-
-
 void
 trap_init(const char *ver)
 {
+  int r;
   uint8_t digest[20];
   struct sigaction sa, old;
   char path[256];
 
-  struct SHA1Context binsum;
+  SHA_CTX binsum;
   int fd;
 
+  r = readlink("/proc/self/exe", self, sizeof(self) - 1);
+  if(r == -1)
+    self[0] = 0;
+  else
+    self[r] = 0;
   
   if((fd = open("/proc/self/exe", O_RDONLY)) != -1) {
     struct stat st;
@@ -163,9 +248,9 @@ trap_init(const char *ver)
       char *m = malloc(st.st_size);
       if(m != NULL) {
 	if(read(fd, m, st.st_size) == st.st_size) {
-	  SHA1Reset(&binsum);
-	  SHA1Input(&binsum, (void *)m, st.st_size);
-	  SHA1Result(&binsum, digest);
+	  SHA_Init(&binsum);
+	  SHA_Update(&binsum, (void *)m, st.st_size);
+	  SHA_Final(digest, &binsum);
 	}
 	free(m);
       }
@@ -176,7 +261,7 @@ trap_init(const char *ver)
 	   "PRG: %s (%s) "
 	   "[%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x"
 	   "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x] "
-	   "CWD: %s ", ver, htsversion_full,
+	   "CWD: %s ", ver, tvheadend_version,
 	   digest[0],
 	   digest[1],
 	   digest[2],

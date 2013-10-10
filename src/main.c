@@ -19,7 +19,6 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <iconv.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -29,6 +28,7 @@
 #include <syslog.h>
 #include <limits.h>
 #include <time.h>
+#include <locale.h>
 
 #include <pwd.h>
 #include <grp.h>
@@ -36,13 +36,13 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#include "tvhead.h"
+#include "tvheadend.h"
 #include "tcp.h"
 #include "access.h"
 #include "http.h"
 #include "webui/webui.h"
 #include "dvb/dvb.h"
-#include "xmltv.h"
+#include "epggrab.h"
 #include "spawn.h"
 #include "subscriptions.h"
 #include "serviceprobe.h"
@@ -53,15 +53,15 @@
 #include "rawtsinput.h"
 #include "avahi.h"
 #include "iptv_input.h"
-#include "transports.h"
+#include "service.h"
 #include "v4l.h"
 #include "trap.h"
 #include "settings.h"
 #include "ffdecsa/FFdecsa.h"
+#include "muxes.h"
+#include "config2.h"
 
 int running;
-extern const char *htsversion;
-extern const char *htsversion_full;
 time_t dispatch_clock;
 static LIST_HEAD(, gtimer) gtimers;
 pthread_mutex_t global_lock;
@@ -73,6 +73,10 @@ static int log_decorate;
 int log_debug_to_syslog;
 int log_debug_to_console;
 
+int webui_port;
+int htsp_port;
+int htsp_port_extra;
+char *tvheadend_cwd;
 
 static void
 handle_sigpipe(int x)
@@ -86,6 +90,21 @@ doexit(int x)
   running = 0;
 }
 
+static int
+get_user_groups (const struct passwd *pw, gid_t* glist, size_t gmax)
+{
+  int num = 0;
+  struct group *gr;
+  char **mem;
+  glist[num++] = pw->pw_gid;
+  for ( gr = getgrent(); (gr != NULL) && (num < gmax); gr = getgrent() ) {
+    if (gr->gr_gid == pw->pw_gid) continue;
+    for (mem = gr->gr_mem; *mem; mem++) {
+      if(!strcmp(*mem, pw->pw_name)) glist[num++] = gr->gr_gid;
+    }
+  }
+  return num;
+}
 
 /**
  *
@@ -150,13 +169,16 @@ gtimer_disarm(gtimer_t *gti)
 static void
 usage(const char *argv0)
 {
-  printf("HTS Tvheadend %s\n", htsversion_full);
+  printf("HTS Tvheadend %s\n", tvheadend_version);
   printf("usage: %s [options]\n", argv0);
   printf("\n");
   printf(" -a <adapters>   Use only DVB adapters specified (csv)\n");
   printf(" -c <directory>  Alternate configuration path.\n"
 	 "                 Defaults to [$HOME/.hts/tvheadend]\n");
+  printf(" -m <directory>  Alternate mux configuration directory\n");
   printf(" -f              Fork and daemonize\n");
+  printf(" -p <pidfile>    Write pid to <pidfile> instead of /var/run/tvheadend.pid,\n"
+        "                 only works with -f\n");
   printf(" -u <username>   Run as user <username>, only works with -f\n");
   printf(" -g <groupname>  Run as group <groupname>, only works with -f\n");
   printf(" -C              If no useraccount exist then create one with\n"
@@ -165,6 +187,8 @@ usage(const char *argv0)
 	 "                 to your Tvheadend installation until you edit\n"
 	 "                 the access-control from within the Tvheadend UI\n");
   printf(" -s              Log debug to syslog\n");
+  printf(" -w <portnumber> WebUI access port [default 9981]\n");
+  printf(" -e <portnumber> HTSP access port [default 9982]\n");
   printf("\n");
   printf("Development options\n");
   printf("\n");
@@ -228,6 +252,7 @@ main(int argc, char **argv)
   int c;
   int forkaway = 0;
   FILE *pidfile;
+  const char *pidpath = "/var/run/tvheadend.pid";
   struct group *grp;
   struct passwd *pw;
   const char *usernam = NULL;
@@ -237,16 +262,25 @@ main(int argc, char **argv)
   sigset_t set;
   const char *homedir;
   const char *rawts_input = NULL;
+  const char *dvb_rawts_input = NULL;
   const char *join_transport = NULL;
   const char *confpath = NULL;
   char *p, *endp;
   uint32_t adapter_mask = 0xffffffff;
   int crash = 0;
+  webui_port = 9981;
+  htsp_port = 9982;
+
+  /* Get current directory */
+  tvheadend_cwd = dirname(dirname(tvh_strdupa(argv[0])));
+
+  /* Set locale */
+  setlocale(LC_ALL, "");
 
   // make sure the timezone is set
   tzset();
 
-  while((c = getopt(argc, argv, "Aa:fu:g:c:Chdr:j:s")) != -1) {
+  while((c = getopt(argc, argv, "Aa:fp:u:g:c:Chdr:j:sw:e:E:R:")) != -1) {
     switch(c) {
     case 'a':
       adapter_mask = 0x0;
@@ -274,6 +308,18 @@ main(int argc, char **argv)
     case 'f':
       forkaway = 1;
       break;
+    case 'p':
+      pidpath = optarg;
+      break;
+    case 'w':
+      webui_port = atoi(optarg);
+      break;
+    case 'e':
+      htsp_port = atoi(optarg);
+      break;
+    case 'E':
+      htsp_port_extra = atoi(optarg);
+      break;
     case 'u':
       usernam = optarg;
       break;
@@ -295,6 +341,9 @@ main(int argc, char **argv)
     case 'r':
       rawts_input = optarg;
       break;
+    case 'R':
+      dvb_rawts_input = optarg;
+      break;
     case 'j':
       join_transport = optarg;
       break;
@@ -305,38 +354,35 @@ main(int argc, char **argv)
 
   signal(SIGPIPE, handle_sigpipe);
 
-  grp = getgrnam(groupnam ?: "video");
-  pw = usernam ? getpwnam(usernam) : NULL;
-
-
   if(forkaway) {
+    grp  = getgrnam(groupnam ?: "video");
+    pw   = usernam ? getpwnam(usernam) : NULL;
 
     if(daemon(0, 0)) {
       exit(2);
     }
-
-    pidfile = fopen("/var/run/tvheadend.pid", "w+");
+    pidfile = fopen(pidpath, "w+");
     if(pidfile != NULL) {
       fprintf(pidfile, "%d\n", getpid());
       fclose(pidfile);
     }
 
-   if(grp != NULL) {
+    if(grp != NULL) {
       setgid(grp->gr_gid);
     } else {
       setgid(1);
     }
 
-   if(pw != NULL) {
+    if (pw != NULL) {
+      gid_t glist[10];
+      int gnum = get_user_groups(pw, glist, 10);
+      setgroups(gnum, glist);
       setuid(pw->pw_uid);
+      homedir = pw->pw_dir;
+      setenv("HOME", homedir, 1);
     } else {
       setuid(1);
     }
-
-   if(pw != NULL) {
-     homedir = pw->pw_dir;
-     setenv("HOME", homedir, 1);
-   }
 
     umask(0);
   }
@@ -357,22 +403,29 @@ main(int argc, char **argv)
 
   pthread_mutex_lock(&global_lock);
 
+  time(&dispatch_clock);
+
   trap_init(argv[0]);
   
   /**
    * Initialize subsystems
    */
-  xmltv_init();   /* Must be initialized before channels */
 
-  transport_init();
+  config_init();
+
+  muxes_init();
+
+  service_init();
 
   channels_init();
+
+  subscription_init();
 
   access_init(createdefault);
 
   tcp_server_init();
 #if ENABLE_LINUXDVB
-  dvb_init(adapter_mask);
+  dvb_init(adapter_mask, dvb_rawts_input);
 #endif
   iptv_input_init();
 #if ENABLE_V4L
@@ -380,7 +433,7 @@ main(int argc, char **argv)
 #endif
   http_server_init();
 
-  webui_init(TVHEADEND_CONTENT_PATH);
+  webui_init();
 
   serviceprobe_init();
 
@@ -388,6 +441,7 @@ main(int argc, char **argv)
 
   capmt_init();
 
+  epggrab_init();
   epg_init();
 
   dvr_init();
@@ -405,6 +459,8 @@ main(int argc, char **argv)
 #ifdef CONFIG_AVAHI
   avahi_init();
 #endif
+
+  epg_updated(); // cleanup now all prev ref's should have been created
 
   pthread_mutex_unlock(&global_lock);
 
@@ -425,13 +481,15 @@ main(int argc, char **argv)
 
   tvhlog(LOG_NOTICE, "START", "HTS Tvheadend version %s started, "
 	 "running as PID:%d UID:%d GID:%d, settings located in '%s'",
-	 htsversion_full,
+	 tvheadend_version,
 	 getpid(), getuid(), getgid(), hts_settings_get_root());
 
   if(crash)
     abort();
 
   mainloop();
+
+  epg_save();
 
   tvhlog(LOG_NOTICE, "STOP", "Exiting HTS Tvheadend");
 
@@ -476,14 +534,17 @@ tvhlogv(int notify, int severity, const char *subsys, const char *fmt,
     syslog(severity, "%s", buf);
 
   /**
+   * Get time (string)
+   */
+  time(&now);
+  localtime_r(&now, &tm);
+  strftime(t, sizeof(t), "%b %d %H:%M:%S", &tm);
+
+  /**
    * Send notification to Comet (Push interface to web-clients)
    */
   if(notify) {
     htsmsg_t *m;
-
-    time(&now);
-    localtime_r(&now, &tm);
-    strftime(t, sizeof(t), "%b %d %H:%M:%S", &tm);
 
     snprintf(buf2, sizeof(buf2), "%s %s", t, buf);
     m = htsmsg_create_map();
@@ -508,7 +569,7 @@ tvhlogv(int notify, int severity, const char *subsys, const char *fmt,
     } else {
       sgroff = "\033[0m";
     }
-    fprintf(stderr, "%s[%s]:%s%s\n", sgr, leveltxt, buf, sgroff);
+    fprintf(stderr, "%s%s [%s]:%s%s\n", sgr, t, leveltxt, buf, sgroff);
   }
 }
 

@@ -29,18 +29,17 @@
 #include <errno.h>
 #include <ctype.h>
 
-#include "tvhead.h"
+#include "tvheadend.h"
 #include "teletext.h"
-#include "transports.h"
 #include "packet.h"
 #include "streaming.h"
+#include "service.h"
 
 /**
  *
  */
 typedef struct tt_mag {
   int ttm_curpage;
-  int ttm_inactive;
   int64_t ttm_current_pts;
   uint8_t ttm_lang;
   uint8_t ttm_page[23*40 + 1];
@@ -61,7 +60,7 @@ typedef struct tt_private {
 
 static void teletext_rundown_copy(tt_private_t *ttp, tt_mag_t *ttm);
 
-static void teletext_rundown_scan(th_transport_t *t, tt_private_t *ttp);
+static void teletext_rundown_scan(service_t *t, tt_private_t *ttp);
 
 #define bitreverse(b) \
 (((b) * 0x0202020202ULL & 0x010884422010ULL) % 1023)
@@ -236,7 +235,7 @@ is_tt_clock(const uint8_t *str)
  *
  */
 static int
-update_tt_clock(th_transport_t *t, const uint8_t *buf)
+update_tt_clock(service_t *t, const uint8_t *buf)
 {
   uint8_t str[10];
   int i;
@@ -250,17 +249,17 @@ update_tt_clock(th_transport_t *t, const uint8_t *buf)
     return 0;
 
   ti = tt_construct_unix_time(str);
-  if(t->tht_tt_clock == ti)
+  if(t->s_tt_clock == ti)
     return 0;
 
-  t->tht_tt_clock = ti;
+  t->s_tt_clock = ti;
   //  printf("teletext clock is: %s", ctime(&ti));
   return 1;
 }
 
 
 static void
-extract_subtitle(th_transport_t *t, th_stream_t *st,
+extract_subtitle(service_t *t, elementary_stream_t *st,
 		 tt_mag_t *ttm, int64_t pts)
 {
   int i, j, off = 0;
@@ -299,23 +298,23 @@ extract_subtitle(th_transport_t *t, th_stream_t *st,
       sub[off++] = '\n';
   }
 
-  if(off == 0 && st->st_blank)
+  if(off == 0 && st->es_blank)
     return; // Avoid multiple blank subtitles
 
-  st->st_blank = !off;
+  st->es_blank = !off;
 
-  if(st->st_curpts == pts)
+  if(st->es_curpts == pts)
     pts++; // Avoid non-monotonic PTS
 
-  st->st_curpts = pts;
+  st->es_curpts = pts;
 
   sub[off++] = 0;
   
   th_pkt_t *pkt = pkt_alloc(sub, off, pts, pts);
-  pkt->pkt_componentindex = st->st_index;
+  pkt->pkt_componentindex = st->es_index;
 
   streaming_message_t *sm = streaming_msg_create_pkt(pkt);
-  streaming_pad_deliver(&t->tht_streaming_pad, sm);
+  streaming_pad_deliver(&t->s_streaming_pad, sm);
   streaming_msg_free(sm);
 
   /* Decrease our own reference to the packet */
@@ -354,16 +353,16 @@ dump_page(tt_mag_t *ttm)
 
 
 static void
-tt_subtitle_deliver(th_transport_t *t, th_stream_t *parent, tt_mag_t *ttm)
+tt_subtitle_deliver(service_t *t, elementary_stream_t *parent, tt_mag_t *ttm)
 {
-  th_stream_t *st;
+  elementary_stream_t *st;
 
   if(ttm->ttm_current_pts == PTS_UNSET)
     return;
 
-  TAILQ_FOREACH(st, &t->tht_components, st_link) {
-     if(parent->st_pid == st->st_parent_pid &&
-	ttm->ttm_curpage == st->st_pid -  PID_TELETEXT_BASE) {
+  TAILQ_FOREACH(st, &t->s_components, es_link) {
+     if(parent->es_pid == st->es_parent_pid &&
+	ttm->ttm_curpage == st->es_pid -  PID_TELETEXT_BASE) {
        extract_subtitle(t, st, ttm, ttm->ttm_current_pts);
      }
   }
@@ -373,18 +372,18 @@ tt_subtitle_deliver(th_transport_t *t, th_stream_t *parent, tt_mag_t *ttm)
  *
  */
 static void
-tt_decode_line(th_transport_t *t, th_stream_t *st, uint8_t *buf)
+tt_decode_line(service_t *t, elementary_stream_t *st, uint8_t *buf)
 {
-  uint8_t mpag, line, s12, s34, c;
+  uint8_t mpag, line, s12, c;
   int page, magidx, i;
   tt_mag_t *ttm;
   tt_private_t *ttp;
 
-  if(st->st_priv == NULL) {
+  if(st->es_priv == NULL) {
     /* Allocate privdata for reassembly */
-    ttp = st->st_priv = calloc(1, sizeof(tt_private_t));
+    ttp = st->es_priv = calloc(1, sizeof(tt_private_t));
   } else {
-    ttp = st->st_priv;
+    ttp = st->es_priv;
   }
 
   mpag = ham_decode(buf[0], buf[1]);
@@ -397,8 +396,7 @@ tt_decode_line(th_transport_t *t, th_stream_t *st, uint8_t *buf)
   case 0:
     if(ttm->ttm_curpage != 0) {
 
-      if(ttm->ttm_inactive == 0)
-	tt_subtitle_deliver(t, st, ttm);
+      tt_subtitle_deliver(t, st, ttm);
 
       if(ttm->ttm_curpage == 192)
 	teletext_rundown_copy(ttp, ttm);
@@ -416,7 +414,6 @@ tt_decode_line(th_transport_t *t, th_stream_t *st, uint8_t *buf)
     ttm->ttm_curpage = page;
 
     s12 = ham_decode(buf[4], buf[5]);
-    s34 = ham_decode(buf[6], buf[7]);
     c = ham_decode(buf[8], buf[9]);
 
     ttm->ttm_lang = c >> 5;
@@ -429,12 +426,10 @@ tt_decode_line(th_transport_t *t, th_stream_t *st, uint8_t *buf)
     if(update_tt_clock(t, buf + 34))
       teletext_rundown_scan(t, ttp);
 
-    ttm->ttm_current_pts = t->tht_current_pts;
-    ttm->ttm_inactive = 0;
+    ttm->ttm_current_pts = t->s_current_pts;
     break;
 
   case 1 ... 23:
-    ttm->ttm_inactive = 0;
     for(i = 0; i < 40; i++) {
       c = buf[i + 2] & 0x7f;
       ttm->ttm_page[i + 40 * (line - 1)] = c;
@@ -447,35 +442,11 @@ tt_decode_line(th_transport_t *t, th_stream_t *st, uint8_t *buf)
 }
 
 
-
-
-/**
- *
- */
-static void
-teletext_scan_stream(th_transport_t *t, th_stream_t *st)
-{
-  tt_private_t *ttp = st->st_priv;
-  tt_mag_t *ttm;
-  int i;
-
-  if(ttp == NULL)
-    return;
-  for(i = 0; i < 8; i++) {
-    ttm = &ttp->ttp_mags[i];
-    ttm->ttm_inactive++;
-    if(ttm->ttm_inactive == 2) {
-      tt_subtitle_deliver(t, st, ttm);
-    }
-  }
-}
-
-
 /**
  *
  */
 void
-teletext_input(th_transport_t *t, th_stream_t *st, const uint8_t *tsb)
+teletext_input(service_t *t, elementary_stream_t *st, const uint8_t *tsb)
 {
   int i, j;
   const uint8_t *x;
@@ -490,7 +461,6 @@ teletext_input(th_transport_t *t, th_stream_t *st, const uint8_t *tsb)
     }
     x += 46;
   }
-  teletext_scan_stream(t, st);
 }
 
 
@@ -499,30 +469,29 @@ teletext_input(th_transport_t *t, th_stream_t *st, const uint8_t *tsb)
  * Swedish TV4 rundown dump (page 192)
  *
 
-  Starttid Titel                L{ngd      | 20 83 53
- ,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,   | 94 2c 2c
-  23:47:05 Reklam block         00:04:15   | 8d 83 32
+  Starttid Titel                L{ngd      | 3 3 53
+ ,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,   | 14 2c 2c
+  19:00:00 TV4Nyheterna         00:14:00   | d 7 31
                                            | 20 20 20
- ,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,   | 94 2c 2c
-  23:47:30 HV3 BENGT OCH PETRA  00:00:03   | 20 86 32
-  23:47:34 S-6/6 : Spoons I 6 ( 00:10:23   | 20 87 32
-  23:57:57 RV3 FOLK I TRAPPAN   00:00:03   | 20 86 32
-  23:59:36 Reklam block         00:02:50   | 20 83 32
-  00:00:01 LINEUP13 BENGT OCH P 00:00:13   | 20 86 30
-  00:00:14 AABILO6123           00:00:13   | 20 86 30
-  00:00:28 S-4/6 : Allo Allo IV 00:10:28   | 20 87 30
-  00:10:57 RV3 VITA RENA PRICKA 00:00:03   | 20 86 30
-  00:11:00 LOKAL REKLAM         00:01:31   | 20 81 30
-  00:16:37 Reklam block         00:04:25   | 20 83 30
-  00:16:58 HV3 BYGGLOV 2        00:00:03   | 20 86 30
-  00:17:51 Trailer block        00:01:20   | 20 82 30
-  00:18:21 S-4/6 : Allo Allo IV 00:14:14   | 20 87 30
-  00:32:36 AABILO6123           00:00:13   | 20 86 30
- ,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,   | 94 2c 2c
- se {ven rundown.tv4.se                    | 83 73 65
-                                           | 83 20 20
-                                   23:43   | 83 20 20
-
+ ,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,   | 14 2c 2c
+  19:14:00 Lokala nyheter       00:03:00   | 1 1 31
+  19:17:00 TV4Nyheterna 19.00 2 00:02:02   | 7 7 31
+  19:19:02 Vinjett              00:00:03   | 6 6 31
+  19:19:05 Reklam               00:02:30   | 3 3 31
+  19:21:35 Vinjett              00:00:06   | 6 6 31
+  19:21:41 LOKAL BILLBOARD      00:00:16   | 1 1 31
+  19:21:57 Lokalt v{der         00:01:00   | 1 1 31
+  19:22:57 S4NVMT1553           00:00:15   | 6 6 31
+  19:23:12 V{der                00:02:00   | 7 7 31
+  19:25:12 Trailer              00:01:00   | 2 2 31
+  19:26:12 Vinjett              00:00:03   | 6 6 31
+  19:26:15 Reklam               00:02:20   | 3 3 31
+  19:28:35 Vinjett              00:00:07   | 6 6 31
+  19:28:42 Hall} 16:9           00:00:30   | 7 7 31
+ ,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,   | 14 2c 2c
+                                           | 20 20 20
+TV4                                        | 54 56 34
+                                           | 20 20 20
 */
 
 
@@ -551,9 +520,8 @@ teletext_rundown_copy(tt_private_t *ttp, tt_mag_t *ttm)
 {
   /* Sanity check */
   if(memcmp((char *)ttm->ttm_page + 2, "Starttid", strlen("Starttid")) ||
-     memcmp((char *)ttm->ttm_page + 11,"Titel", strlen("Titel")) ||
-     memcmp((char *)ttm->ttm_page + 20 * 40 + 9,
-	    "rundown.tv4.se", strlen("rundown.tv4.se")))
+     memcmp((char *)ttm->ttm_page + 11, "Titel", strlen("Titel")) ||
+     memcmp((char *)ttm->ttm_page + 21 * 40, "TV4", strlen("TV4")))
     return;
   
   memcpy(ttp->ttp_rundown, ttm->ttm_page, 23 * 40);
@@ -562,11 +530,11 @@ teletext_rundown_copy(tt_private_t *ttp, tt_mag_t *ttm)
 
 
 static void
-teletext_rundown_scan(th_transport_t *t, tt_private_t *ttp)
+teletext_rundown_scan(service_t *t, tt_private_t *ttp)
 {
   int i;
   uint8_t *l;
-  time_t now = t->tht_tt_clock, start, stop, last = 0;
+  time_t now = t->s_tt_clock, start, stop, last = 0;
   th_commercial_advice_t ca;
 
   if(ttp->ttp_rundown_valid == 0)
@@ -574,7 +542,7 @@ teletext_rundown_scan(th_transport_t *t, tt_private_t *ttp)
 
   for(i = 0; i < 23; i++) {
     l = ttp->ttp_rundown + 40 * i;
-    if((l[1] & 0xf0) != 0x80 || !is_tt_clock(l + 32) || !is_tt_clock(l + 2))
+    if((l[1] & 0xf0) != 0x00 || !is_tt_clock(l + 32) || !is_tt_clock(l + 2))
       continue;
     
     if(!memcmp(l + 11, "Nyhetspuff", strlen("Nyhetspuff")))
@@ -586,9 +554,9 @@ teletext_rundown_scan(th_transport_t *t, tt_private_t *ttp)
     stop  = start + tt_time_to_len(l + 32);
     
     if(start <= now && stop > now)
-      t->tht_tt_commercial_advice = ca;
+      t->s_tt_commercial_advice = ca;
     
-    if(start > now && ca != t->tht_tt_commercial_advice && last == 0)
+    if(start > now && ca != t->s_tt_commercial_advice && last == 0)
       last = start;
   }
 }

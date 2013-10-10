@@ -23,12 +23,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "tvhead.h"
+#include "tvheadend.h"
 #include "http.h"
 #include "webui.h"
 #include "access.h"
 #include "epg.h"
-#include "xmltv.h"
 #include "psi.h"
 #if ENABLE_LINUXDVB
 #include "dvr/dvr.h"
@@ -36,10 +35,7 @@
 #include "dvb/dvb_support.h"
 #endif
 
-#include "transports.h"
-
 extern char tvh_binshasum[20];
-extern char *htsversion_full;
 
 int page_statedump(http_connection_t *hc, const char *remain, void *opaque);
 
@@ -71,28 +67,26 @@ dumpchannels(htsbuf_queue_t *hq)
 		   "  refcount = %d\n"
 		   "  zombie = %d\n"
 		   "  number = %d\n"
-		   "  xmltv source = %s\n"
 		   "  icon = %s\n\n",
 		   ch->ch_refcount,
 		   ch->ch_zombie,
 		   ch->ch_number,
-		   ch->ch_xc ? ch->ch_xc->xc_displayname : "<none set>",
 		   ch->ch_icon ?: "<none set>");
   }
 }
 
 #if ENABLE_LINUXDVB
 static void
-dumptransports(htsbuf_queue_t *hq, struct th_transport_list *l, int indent)
+dumptransports(htsbuf_queue_t *hq, struct service_list *l, int indent)
 {
-  th_transport_t *t;
-  th_stream_t *st;
+  service_t *t;
+  elementary_stream_t *st;
 
   outputtitle(hq, indent, "Transports (or services)");
-  LIST_FOREACH(t, l, tht_group_link) {
+  LIST_FOREACH(t, l, s_group_link) {
 
     htsbuf_qprintf(hq, "%*.s%s (%s)\n", indent + 2, "",
-		   transport_nicename(t), t->tht_identifier);
+		   service_nicename(t), t->s_identifier);
 	
     
     htsbuf_qprintf(hq, "%*.s%-16s %-5s %-5s %-5s %-5s %-10s\n", indent + 4, "",
@@ -106,14 +100,14 @@ dumptransports(htsbuf_queue_t *hq, struct th_transport_list *l, int indent)
     htsbuf_qprintf(hq, "%*.s-------------------------------------------\n",
 		   indent + 4, "");
 
-    TAILQ_FOREACH(st, &t->tht_components, st_link) {
+    TAILQ_FOREACH(st, &t->s_components, es_link) {
       caid_t *caid;
       htsbuf_qprintf(hq, "%*.s%-16s %-5d %-5d %-5s\n", indent + 4, "",
-		     streaming_component_type2txt(st->st_type),
-		     st->st_index,
-		     st->st_pid,
-		     st->st_lang[0] ? st->st_lang : "");
-      LIST_FOREACH(caid, &st->st_caids, link) {
+		     streaming_component_type2txt(st->es_type),
+		     st->es_index,
+		     st->es_pid,
+		     st->es_lang[0] ? st->es_lang : "");
+      LIST_FOREACH(caid, &st->es_caids, link) {
 	htsbuf_qprintf(hq, "%*.sCAID %04x (%s) %08x\n", indent + 6, "",
 		       caid->caid,
 		       psi_caid2name(caid->caid),
@@ -164,7 +158,7 @@ page_statedump(http_connection_t *hc, const char *remain, void *opaque)
   htsbuf_qprintf(hq, "Tvheadend %s  Binary SHA1: "
 		 "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x"
 		 "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
-		 htsversion_full,
+		 tvheadend_version,
 		 tvh_binshasum[0],
 		 tvh_binshasum[1],
 		 tvh_binshasum[2],

@@ -30,11 +30,11 @@
 #include <errno.h>
 #include <assert.h>
 
-#include "tvhead.h"
+#include "tvheadend.h"
 #include "parsers.h"
 #include "parser_latm.h"
 #include "bitstream.h"
-
+#include "service.h"
 
 typedef struct latm_private {
 
@@ -57,24 +57,36 @@ latm_get_value(bitstream_t *bs)
 
 
 static void
-read_audio_specific_config(th_stream_t *st, latm_private_t *latm,
+read_audio_specific_config(elementary_stream_t *st, latm_private_t *latm,
 			   bitstream_t *bs)
 {
   int aot, sr;
 
   aot = read_bits(bs, 5);
-  if(aot != 2)
-    return;
 
   latm->sample_rate_index = read_bits(bs, 4);
 
   if(latm->sample_rate_index == 0xf)
+    sr = read_bits(bs, 24);
+  else
+    sr = sri_to_rate(latm->sample_rate_index);
+
+  if(sr == 0)
     return;
 
-  sr = sri_to_rate(latm->sample_rate_index);
-  st->st_frame_duration = 1024 * 90000 / sr;
+  st->es_frame_duration = 1024 * 90000 / sr;
 
   latm->channel_config = read_bits(bs, 4);
+
+  if (aot == 5) { // AOT_SBR
+    if (read_bits(bs, 4) == 0xf) {  // extensionSamplingFrequencyIndex
+	skip_bits(bs, 24);
+    }
+    aot = read_bits(bs, 5);	// this is the main object type (i.e. non-extended)
+  }
+
+  if(aot != 2)
+    return;
 
   skip_bits(bs, 1); //framelen_flag
   if(read_bits1(bs))  // depends_on_coder
@@ -86,7 +98,7 @@ read_audio_specific_config(th_stream_t *st, latm_private_t *latm,
 
 
 static void
-read_stream_mux_config(th_stream_t *st, latm_private_t *latm, bitstream_t *bs)
+read_stream_mux_config(elementary_stream_t *st, latm_private_t *latm, bitstream_t *bs)
 {
   int audio_mux_version = read_bits(bs, 1);
   latm->audio_mux_version_A = 0;
@@ -159,7 +171,7 @@ read_stream_mux_config(th_stream_t *st, latm_private_t *latm, bitstream_t *bs)
  * Parse AAC LATM
  */
 th_pkt_t *
-parse_latm_audio_mux_element(th_transport_t *t, th_stream_t *st, 
+parse_latm_audio_mux_element(service_t *t, elementary_stream_t *st, 
 			     const uint8_t *data, int len)
 {
   latm_private_t *latm;
@@ -169,8 +181,8 @@ parse_latm_audio_mux_element(th_transport_t *t, th_stream_t *st,
 
   init_rbits(&bs, data, len * 8);
 
-  if((latm = st->st_priv) == NULL)
-    latm = st->st_priv = calloc(1, sizeof(latm_private_t));
+  if((latm = st->es_priv) == NULL)
+    latm = st->es_priv = calloc(1, sizeof(latm_private_t));
 
   if(!read_bits1(&bs))
     read_stream_mux_config(st, latm, &bs);
@@ -191,13 +203,13 @@ parse_latm_audio_mux_element(th_transport_t *t, th_stream_t *st,
   if(slot_len * 8 > remaining_bits(&bs))
     return NULL;
 
-  if(st->st_curdts == PTS_UNSET)
+  if(st->es_curdts == PTS_UNSET)
     return NULL;
 
-  th_pkt_t *pkt = pkt_alloc(NULL, slot_len + 7, st->st_curdts, st->st_curdts);
+  th_pkt_t *pkt = pkt_alloc(NULL, slot_len + 7, st->es_curdts, st->es_curdts);
 
-  pkt->pkt_commercial = t->tht_tt_commercial_advice;
-  pkt->pkt_duration = st->st_frame_duration;
+  pkt->pkt_commercial = t->s_tt_commercial_advice;
+  pkt->pkt_duration = st->es_frame_duration;
   pkt->pkt_sri = latm->sample_rate_index;
   pkt->pkt_channels = latm->channel_config;
 
@@ -228,7 +240,7 @@ parse_latm_audio_mux_element(th_transport_t *t, th_stream_t *st,
   for(i = 0; i < slot_len; i++)
     *buf++ = read_bits(&bs, 8);
 
-  st->st_curdts += st->st_frame_duration;
+  st->es_curdts += st->es_frame_duration;
 
   return pkt;
 }

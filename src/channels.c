@@ -30,18 +30,15 @@
 
 #include "settings.h"
 
-#include "tvhead.h"
+#include "tvheadend.h"
 #include "psi.h"
-#include "channels.h"
-#include "transports.h"
 #include "epg.h"
-#include "xmltv.h"
+#include "epggrab.h"
+#include "channels.h"
 #include "dtable.h"
 #include "notify.h"
 #include "dvr/dvr.h"
 #include "htsp.h"
-
-struct channel_list channels_not_xmltv_mapped;
 
 struct channel_tree channel_name_tree;
 static struct channel_tree channel_identifier_tree;
@@ -162,11 +159,11 @@ channel_set_name(channel_t *ch, const char *name)
  *
  */
 static channel_t *
-channel_create(const char *name, int number)
+channel_create2(const char *name, int number)
 {
   channel_t *ch, *x;
-  xmltv_channel_t *xc;
   int id;
+  char buf[32];
 
   ch = RB_LAST(&channel_identifier_tree);
   if(ch == NULL) {
@@ -175,9 +172,12 @@ channel_create(const char *name, int number)
     id = ch->ch_id + 1;
   }
 
+  if (!name || !*name) {
+    snprintf(buf, sizeof(buf), "Channel %d", id);
+    name = buf;
+  }
+
   ch = calloc(1, sizeof(channel_t));
-  RB_INIT(&ch->ch_epg_events);
-  LIST_INSERT_HEAD(&channels_not_xmltv_mapped, ch, ch_xc_link);
   channel_set_name(ch, name);
   ch->ch_number = number;
 
@@ -187,14 +187,19 @@ channel_create(const char *name, int number)
 
   assert(x == NULL);
 
-  if((xc = xmltv_channel_find_by_displayname(name)) != NULL) {
-    channel_set_xmltv_source(ch, xc);
-    if(xc->xc_icon != NULL)
-      channel_set_icon(ch, xc->xc_icon);
-  }
+  epggrab_channel_add(ch);
 
   htsp_channel_add(ch);
   return ch;
+}
+
+/**
+ *
+ */
+channel_t *
+channel_create ( void )
+{
+  return channel_create2(NULL, 0);
 }
 
 /**
@@ -205,13 +210,15 @@ channel_find_by_name(const char *name, int create, int channel_number)
 {
   channel_t skel, *ch;
 
+  if (!name || !*name) return NULL;
+
   lock_assert(&global_lock);
 
   skel.ch_name = (char *)name;
   ch = RB_FIND(&channel_name_tree, &skel, ch_name_link, channelcmp);
   if(ch != NULL || create == 0)
     return ch;
-  return channel_create(name, channel_number);
+  return channel_create2(name, channel_number);
 }
 
 
@@ -237,7 +244,6 @@ static void
 channel_load_one(htsmsg_t *c, int id)
 {
   channel_t *ch;
-  const char *s;
   const char *name = htsmsg_get_str(c, "name");
   htsmsg_t *tags;
   htsmsg_field_t *f;
@@ -257,18 +263,9 @@ channel_load_one(htsmsg_t *c, int id)
     return;
   }
 
-  RB_INIT(&ch->ch_epg_events);
-
   channel_set_name(ch, name);
 
-  if((s = htsmsg_get_str(c, "xmltv-channel")) != NULL &&
-     (ch->ch_xc = xmltv_channel_find(s, 0)) != NULL) {
-    LIST_INSERT_HEAD(&ch->ch_xc->xc_channels, ch, ch_xc_link);
-    tvh_str_update(&ch->ch_icon, ch->ch_xc->xc_icon);
-  } else {
-    LIST_INSERT_HEAD(&channels_not_xmltv_mapped, ch, ch_xc_link);
-  }
-
+  epggrab_channel_add(ch);
 
   tvh_str_update(&ch->ch_icon, htsmsg_get_str(c, "icon"));
 
@@ -323,9 +320,6 @@ channel_save(channel_t *ch)
 
   htsmsg_add_str(m, "name", ch->ch_name);
 
-  if(ch->ch_xc != NULL)
-    htsmsg_add_str(m, "xmltv-channel", ch->ch_xc->xc_identifier);
-
   if(ch->ch_icon != NULL)
     htsmsg_add_str(m, "icon", ch->ch_icon);
 
@@ -344,14 +338,16 @@ channel_save(channel_t *ch)
 }
 
 /**
- * Rename a channel and all tied transports
+ * Rename a channel and all tied services
  */
 int
 channel_rename(channel_t *ch, const char *newname)
 {
-  th_transport_t *t;
+  service_t *t;
 
   lock_assert(&global_lock);
+
+  if (!newname || !*newname) return 0;
 
   if(channel_find_by_name(newname, 0, 0))
     return -1;
@@ -361,9 +357,10 @@ channel_rename(channel_t *ch, const char *newname)
 
   RB_REMOVE(&channel_name_tree, ch, ch_name_link);
   channel_set_name(ch, newname);
+  epggrab_channel_mod(ch);
 
-  LIST_FOREACH(t, &ch->ch_transports, tht_ch_link)
-    t->tht_config_save(t);
+  LIST_FOREACH(t, &ch->ch_services, s_ch_link)
+    t->s_config_save(t);
 
   channel_save(ch);
   htsp_channel_update(ch);
@@ -376,7 +373,7 @@ channel_rename(channel_t *ch, const char *newname)
 void
 channel_delete(channel_t *ch)
 {
-  th_transport_t *t;
+  service_t *t;
   th_subscription_t *s;
   channel_tag_mapping_t *ctm;
 
@@ -392,15 +389,16 @@ channel_delete(channel_t *ch)
 
   dvr_destroy_by_channel(ch);
 
-  while((t = LIST_FIRST(&ch->ch_transports)) != NULL)
-    transport_map_channel(t, NULL, 1);
+  while((t = LIST_FIRST(&ch->ch_services)) != NULL)
+    service_map_channel(t, NULL, 1);
 
   while((s = LIST_FIRST(&ch->ch_subscriptions)) != NULL) {
     LIST_REMOVE(s, ths_channel_link);
     s->ths_channel = NULL;
   }
 
-  epg_unlink_from_channel(ch);
+  epggrab_channel_rem(ch);
+  epg_channel_unlink(ch);
 
   hts_settings_remove("channels/%d", ch->ch_id);
 
@@ -408,8 +406,6 @@ channel_delete(channel_t *ch)
 
   RB_REMOVE(&channel_name_tree, ch, ch_name_link);
   RB_REMOVE(&channel_identifier_tree, ch, ch_identifier_link);
-
-  LIST_REMOVE(ch, ch_xc_link);
 
   free(ch->ch_name);
   free(ch->ch_sname);
@@ -423,22 +419,22 @@ channel_delete(channel_t *ch)
 
 
 /**
- * Merge transports from channel 'src' to channel 'dst'
+ * Merge services from channel 'src' to channel 'dst'
  *
  * Then, destroy the 'src' channel
  */
 void
 channel_merge(channel_t *dst, channel_t *src)
 {
-  th_transport_t *t;
+  service_t *t;
 
   lock_assert(&global_lock);
   
   tvhlog(LOG_NOTICE, "channels", "Channel \"%s\" merged into \"%s\"",
 	 src->ch_name, dst->ch_name);
 
-  while((t = LIST_FIRST(&src->ch_transports)) != NULL)
-    transport_map_channel(t, dst, 1);
+  while((t = LIST_FIRST(&src->ch_services)) != NULL)
+    service_map_channel(t, dst, 1);
 
   channel_delete(src);
 }
@@ -502,33 +498,6 @@ channel_set_number(channel_t *ch, int number)
   channel_save(ch);
   htsp_channel_update(ch);
 }
-
-/**
- *
- */
-void
-channel_set_xmltv_source(channel_t *ch, xmltv_channel_t *xc)
-{
-  lock_assert(&global_lock);
-
-  if(xc == ch->ch_xc)
-    return;
-
-  LIST_REMOVE(ch, ch_xc_link);
-
-  if(xc == NULL) {
-    LIST_INSERT_HEAD(&channels_not_xmltv_mapped, ch, ch_xc_link);
-  } else {
-    LIST_INSERT_HEAD(&xc->xc_channels, ch, ch_xc_link);
-  }
-  ch->ch_xc = xc;
-
-  if(xc != NULL)
-    tvh_str_update(&ch->ch_icon, xc->xc_icon);
-
-  channel_save(ch);
-}
-
 
 /**
  *
@@ -859,6 +828,7 @@ static const dtable_class_t channel_tags_dtc = {
   .dtc_record_delete  = channel_tag_record_delete,
   .dtc_read_access = ACCESS_ADMIN,
   .dtc_write_access = ACCESS_ADMIN,
+  .dtc_mutex = &global_lock,
 };
 
 

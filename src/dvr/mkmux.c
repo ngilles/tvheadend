@@ -26,7 +26,7 @@
 #include <assert.h>
 #include <string.h>
 
-#include "tvhead.h"
+#include "tvheadend.h"
 #include "streaming.h"
 #include "dvr.h"
 #include "mkmux.h"
@@ -70,16 +70,18 @@ struct mk_mux {
   char *filename;
   int error;
   off_t fdpos; // Current position in file
+  int seekable;
 
   mk_track *tracks;
   int ntracks;
+  int has_video;
 
   int64_t totduration;
 
   htsbuf_queue_t *cluster;
   int64_t cluster_tc;
   off_t cluster_pos;
-
+  int cluster_maxsize;
 
   off_t segment_header_pos;
 
@@ -142,14 +144,13 @@ static htsbuf_queue_t *
 mk_build_segment_info(mk_mux_t *mkm)
 {
   htsbuf_queue_t *q = htsbuf_queue_alloc(0);
-  extern char *htsversion_full;
   char app[128];
 
-  snprintf(app, sizeof(app), "HTS Tvheadend %s", htsversion_full);
+  snprintf(app, sizeof(app), "Tvheadend %s", tvheadend_version);
 
   ebml_append_bin(q, 0x73a4, mkm->uuid, sizeof(mkm->uuid));
   ebml_append_string(q, 0x7ba9, mkm->title);
-  ebml_append_string(q, 0x4d80, "HTS Tvheadend Matroska muxer");
+  ebml_append_string(q, 0x4d80, "Tvheadend Matroska muxer");
   ebml_append_string(q, 0x5741, app);
   ebml_append_uint(q, 0x2ad7b1, MATROSKA_TIMESCALE);
 
@@ -216,6 +217,7 @@ mk_build_tracks(mk_mux_t *mkm, const struct streaming_start *ss)
       codec_id = "A_EAC3";
       break;
 
+    case SCT_MP4A:
     case SCT_AAC:
       tracktype = 2;
       codec_id = "A_AAC";
@@ -238,7 +240,8 @@ mk_build_tracks(mk_mux_t *mkm, const struct streaming_start *ss)
     mkm->tracks[i].enabled = 1;
     tracknum++;
     mkm->tracks[i].tracknum = tracknum;
-
+    mkm->has_video |= (tracktype == 1);
+    
     t = htsbuf_queue_alloc(0);
 
     ebml_append_uint(t, 0xd7, mkm->tracks[i].tracknum);
@@ -253,6 +256,7 @@ mk_build_tracks(mk_mux_t *mkm, const struct streaming_start *ss)
     switch(ssc->ssc_type) {
     case SCT_H264:
     case SCT_MPEG2VIDEO:
+    case SCT_MP4A:
     case SCT_AAC:
       if(ssc->ssc_gh)
 	ebml_append_bin(t, 0x63a2, 
@@ -310,7 +314,7 @@ mk_build_tracks(mk_mux_t *mkm, const struct streaming_start *ss)
 /**
  *
  */
-static void
+static int
 mk_write_to_fd(mk_mux_t *mkm, htsbuf_queue_t *hq)
 {
   htsbuf_data_t *hd;
@@ -332,14 +336,14 @@ mk_write_to_fd(mk_mux_t *mkm, htsbuf_queue_t *hq)
     int iovcnt = i < dvr_iov_max ? i : dvr_iov_max;
     if((r = writev(mkm->fd, iov, iovcnt)) == -1) {
       mkm->error = errno;
-      tvhlog(LOG_ERR, "MKV", "%s: Unable to write -- %s",
-	     mkm->filename, strerror(errno));
-      return;
+      return -1;
     }
     mkm->fdpos += r;
     i -= iovcnt;
     iov += iovcnt;
   } while(i);
+
+  return 0;
 }
 
 
@@ -349,8 +353,9 @@ mk_write_to_fd(mk_mux_t *mkm, htsbuf_queue_t *hq)
 static void
 mk_write_queue(mk_mux_t *mkm, htsbuf_queue_t *q)
 {
-  if(!mkm->error)
-    mk_write_to_fd(mkm, q);
+  if(!mkm->error && mk_write_to_fd(mkm, q))
+    tvhlog(LOG_ERR, "mkv", "%s: Write failed -- %s", mkm->filename, 
+	   strerror(errno));
 
   htsbuf_queue_flush(q);
 }
@@ -372,14 +377,13 @@ mk_write_master(mk_mux_t *mkm, uint32_t id, htsbuf_queue_t *p)
 /**
  *
  */
-static void
-mk_write_segment_header(mk_mux_t *mkm, int64_t size)
+static htsbuf_queue_t *
+mk_build_segment_header(int64_t size)
 {
-  htsbuf_queue_t q;
+  htsbuf_queue_t *q = htsbuf_queue_alloc(0);
   uint8_t u8[8];
-  htsbuf_queue_init(&q, 0);
 
-  ebml_append_id(&q, 0x18538067);
+  ebml_append_id(q, 0x18538067);
   
   u8[0] = 1;
   if(size == 0) {
@@ -393,9 +397,19 @@ mk_write_segment_header(mk_mux_t *mkm, int64_t size)
     u8[6] = size >> 8;
     u8[7] = size;
   }
-  htsbuf_append(&q, &u8, 8);
+  htsbuf_append(q, &u8, 8);
   
-  mk_write_queue(mkm, &q);
+  return q;
+}
+
+
+/**
+ *
+ */
+static void
+mk_write_segment_header(mk_mux_t *mkm, int64_t size)
+{
+  mk_write_queue(mkm, mk_build_segment_header(size));
 }
 
 
@@ -403,7 +417,7 @@ mk_write_segment_header(mk_mux_t *mkm, int64_t size)
  *
  */
 static htsbuf_queue_t *
-build_tag_string(const char *name, const char *value,
+build_tag_string(const char *name, const char *value, const char *lang,
 		 int targettype, const char *targettypename)
 {
   htsbuf_queue_t *q = htsbuf_queue_alloc(0);
@@ -419,7 +433,7 @@ build_tag_string(const char *name, const char *value,
   ebml_append_string(st, 0x45a3, name);
   ebml_append_string(st, 0x4487, value);
   ebml_append_uint(st, 0x4484, 1);
-  ebml_append_string(st, 0x447a, "und");
+  ebml_append_string(st, 0x447a, lang ?: "und");
 
   ebml_append_master(q, 0x67c8, st);
   return q;
@@ -435,7 +449,7 @@ build_tag_int(const char *name, int value,
 {
   char str[64];
   snprintf(str, sizeof(str), "%d", value);
-  return build_tag_string(name, str, targettype, targettypename);
+  return build_tag_string(name, str, NULL, targettype, targettypename);
 }
 
 
@@ -453,13 +467,22 @@ addtag(htsbuf_queue_t *q, htsbuf_queue_t *t)
  *
  */
 static htsbuf_queue_t *
-mk_build_metadata(const dvr_entry_t *de)
+_mk_build_metadata(const dvr_entry_t *de, const epg_broadcast_t *ebc)
 {
   htsbuf_queue_t *q = htsbuf_queue_alloc(0);
-  char datestr[64];
+  char datestr[64], ctype[100];
+  const epg_genre_t *eg = NULL;
   struct tm tm;
-  const char *ctype;
-  localtime_r(&de->de_start, &tm);
+  localtime_r(de ? &de->de_start : &ebc->start, &tm);
+  epg_episode_t *ee = NULL;
+  channel_t *ch;
+  lang_str_t *ls = NULL;
+
+  if (ebc)               ee = ebc->episode;
+  else if (de->de_bcast) ee = de->de_bcast->episode;
+
+  if (de) ch = de->de_channel;
+  else    ch = ebc->channel;
 
   snprintf(datestr, sizeof(datestr),
 	   "%04d-%02d-%02d %02d:%02d:%02d",
@@ -470,38 +493,49 @@ mk_build_metadata(const dvr_entry_t *de)
 	   tm.tm_min,
 	   tm.tm_sec);
 
-  addtag(q, build_tag_string("DATE_BROADCASTED", datestr, 0, NULL));
+  addtag(q, build_tag_string("DATE_BROADCASTED", datestr, NULL, 0, NULL));
 
-  addtag(q, build_tag_string("ORIGINAL_MEDIA_TYPE", "TV", 0, NULL));
+  addtag(q, build_tag_string("ORIGINAL_MEDIA_TYPE", "TV", NULL, 0, NULL));
 
-  
-  if(de->de_content_type) {
-    ctype = epg_content_group_get_name(de->de_content_type);
-    if(ctype != NULL)
-      addtag(q, build_tag_string("CONTENT_TYPE", ctype, 0, NULL));
+  if(de && de->de_content_type.code) {
+    eg = &de->de_content_type;
+  } else if (ee) {
+    eg = LIST_FIRST(&ee->genre);
+  }
+  if(eg && epg_genre_get_str(eg, 1, 0, ctype, 100))
+    addtag(q, build_tag_string("CONTENT_TYPE", ctype, NULL, 0, NULL));
+
+  if(ch)
+    addtag(q, build_tag_string("TVCHANNEL", ch->ch_name, NULL, 0, NULL));
+
+  if(de && de->de_desc)
+    ls = de->de_desc;
+  else if (ee && ee->description)
+    ls = ee->description;
+  else if (ee && ee->summary)
+    ls = ee->summary;
+  if (ls) {
+    lang_str_ele_t *e;
+    RB_FOREACH(e, ls, link)
+      addtag(q, build_tag_string("SUMMARY", e->str, e->lang, 0, NULL));
   }
 
-  if(de->de_channel != NULL)
-    addtag(q, build_tag_string("TVCHANNEL", de->de_channel->ch_name, 0, NULL));
-
-  if(de->de_episode.ee_onscreen)
-    addtag(q, build_tag_string("SYNOPSIS", 
-			       de->de_episode.ee_onscreen, 0, NULL));
-
-  if(de->de_desc != NULL)
-    addtag(q, build_tag_string("SUMMARY", de->de_desc, 0, NULL));
-
-  if(de->de_episode.ee_season)
-    addtag(q, build_tag_int("PART_NUMBER", de->de_episode.ee_season,
-			    60, "SEASON"));
-
-  if(de->de_episode.ee_episode)
-    addtag(q, build_tag_int("PART_NUMBER", de->de_episode.ee_episode,
-			    0, NULL));
-
-  if(de->de_episode.ee_part)
-    addtag(q, build_tag_int("PART_NUMBER", de->de_episode.ee_part,
-			    40, "PART"));
+  if (ee) {
+    epg_episode_num_t num;
+    epg_episode_get_epnum(ee, &num);
+    if(num.e_num)
+      addtag(q, build_tag_int("PART_NUMBER", num.e_num,
+			       0, NULL));
+    if(num.s_num)
+      addtag(q, build_tag_int("PART_NUMBER", num.s_num,
+			       60, "SEASON"));
+    if(num.p_num)
+      addtag(q, build_tag_int("PART_NUMBER", num.p_num,
+			       40, "PART"));
+    if (num.text)
+      addtag(q, build_tag_string("SYNOPSIS", 
+			       num.text, NULL, 0, NULL));
+  }
 
   return q;
 }
@@ -519,6 +553,7 @@ mk_build_one_metaseek(mk_mux_t *mkm, uint32_t id, off_t pos)
   ebml_append_uint(q, 0x53ac, pos - mkm->segment_pos);
   return q;
 }
+
 
 /**
  *
@@ -550,6 +585,7 @@ mk_build_metaseek(mk_mux_t *mkm)
   return q;
 }
 
+
 /**
  *
  */
@@ -568,7 +604,7 @@ mk_write_metaseek(mk_mux_t *mkm, int first)
   
   if(first) {
     mk_write_to_fd(mkm, &q);
-  } else {
+  } else if(mkm->seekable) {
     off_t prev = mkm->fdpos;
     if(lseek(mkm->fd, mkm->segment_pos, SEEK_SET) == (off_t) -1)
       mkm->error = errno;
@@ -582,52 +618,29 @@ mk_write_metaseek(mk_mux_t *mkm, int first)
   htsbuf_queue_flush(&q);
 }
 
+
 /**
  *
  */
-mk_mux_t *
-mk_mux_create(const char *filename,
-	      const struct streaming_start *ss,
-	      const struct dvr_entry *de,
-	      int write_tags)
+static htsbuf_queue_t *
+mk_build_segment(mk_mux_t *mkm, 
+		 const struct streaming_start *ss)
 {
-  mk_mux_t *mkm;
-  int fd;
+  htsbuf_queue_t *p = htsbuf_queue_alloc(0);
 
-  fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0777);
-  if(fd == -1)
-    return NULL;
+  assert(mkm->segment_pos != 0);
 
-  mkm = calloc(1, sizeof(struct mk_mux));
-  getuuid(mkm->uuid);
-  mkm->filename = strdup(filename);
-  mkm->fd = fd;
-  mkm->title = strdup(de->de_title);
-  TAILQ_INIT(&mkm->cues);
+  // Meta seek
+  if(mkm->seekable)
+    ebml_append_pad(p, 500);
 
-  mk_write_master(mkm, 0x1a45dfa3, mk_build_ebmlheader());
+  mkm->segmentinfo_pos = mkm->segment_pos + p->hq_size;
+  ebml_append_master(p, 0x1549a966, mk_build_segment_info(mkm));
 
-  mkm->segment_header_pos = mkm->fdpos;
-  mk_write_segment_header(mkm, 0);
-
-  mkm->segment_pos = mkm->fdpos;
-  mk_write_metaseek(mkm, 1); // Must be first in segment
-
-
-  mkm->segmentinfo_pos = mkm->fdpos;
-  mk_write_master(mkm, 0x1549a966, mk_build_segment_info(mkm));
-
-  mkm->trackinfo_pos = mkm->fdpos;
-  mk_write_master(mkm, 0x1654ae6b, mk_build_tracks(mkm, ss));
-
-  if(write_tags) {
-    mkm->metadata_pos = mkm->fdpos;
-    mk_write_master(mkm, 0x1254c367, mk_build_metadata(de));
-  }
-
-  mk_write_metaseek(mkm, 0);
-
-  return mkm;
+  mkm->trackinfo_pos = mkm->segment_pos + p->hq_size;
+  ebml_append_master(p, 0x1654ae6b, mk_build_tracks(mkm, ss));
+  
+  return p;
 }
 
 
@@ -670,9 +683,12 @@ mk_write_frame_i(mk_mux_t *mkm, mk_track *t, th_pkt_t *pkt)
   int skippable = pkt->pkt_frametype == PKT_B_FRAME;
   int vkeyframe = SCT_ISVIDEO(t->type) && keyframe;
 
-  uint8_t *data;
-  size_t len;
+  uint8_t *data = pktbuf_ptr(pkt->pkt_payload);
+  size_t len = pktbuf_len(pkt->pkt_payload);
   const int clusersizemax = 2000000;
+
+  if(!data || len <= 0)
+    return;
 
   if(pts == PTS_UNSET)
     // This is our best guess, it might be wrong but... oh well
@@ -698,7 +714,10 @@ mk_write_frame_i(mk_mux_t *mkm, mk_track *t, th_pkt_t *pkt)
     return;
   }
 
-  if(vkeyframe && mkm->cluster && mkm->cluster->hq_size > clusersizemax/4)
+  if(vkeyframe && mkm->cluster && mkm->cluster->hq_size > mkm->cluster_maxsize)
+    mk_close_cluster(mkm);
+
+  else if(!mkm->has_video && mkm->cluster && mkm->cluster->hq_size > clusersizemax/40)
     mk_close_cluster(mkm);
 
   else if(mkm->cluster && mkm->cluster->hq_size > clusersizemax)
@@ -720,11 +739,7 @@ mk_write_frame_i(mk_mux_t *mkm, mk_track *t, th_pkt_t *pkt)
     addcue(mkm, pts, t->tracknum);
   }
 
-
-  data = pktbuf_ptr(pkt->pkt_payload);
-  len  = pktbuf_len(pkt->pkt_payload);
-
-  if(t->type == SCT_AAC) {
+  if(t->type == SCT_AAC || t->type == SCT_MP4A) {
     // Skip ADTS header
     if(len < 7)
       return;
@@ -743,32 +758,6 @@ mk_write_frame_i(mk_mux_t *mkm, mk_track *t, th_pkt_t *pkt)
   c_delta_flags[2] = (keyframe << 7) | skippable;
   htsbuf_append(mkm->cluster, c_delta_flags, 3);
   htsbuf_append(mkm->cluster, data, len);
-}
-
-
-/**
- *
- */
-void
-mk_mux_write_pkt(mk_mux_t *mkm, struct th_pkt *pkt)
-{
-  int i;
-  mk_track *t = NULL;
-  for(i = 0; i < mkm->ntracks;i++) {
-    if(mkm->tracks[i].index == pkt->pkt_componentindex &&
-       mkm->tracks[i].enabled) {
-      t = &mkm->tracks[i];
-      break;
-    }
-  }
-  
-  if(t != NULL && !t->disabled) {
-    if(t->merge)
-      pkt = pkt_merge_header(pkt);
-    mk_write_frame_i(mkm, t, pkt);
-  }
-  
-  pkt_ref_dec(pkt);
 }
 
 
@@ -806,10 +795,141 @@ mk_write_cues(mk_mux_t *mkm)
   mk_write_master(mkm, 0x1c53bb6b, q);
 }
 
+
 /**
  *
  */
-void
+mk_mux_t *mk_mux_create(void)
+{
+  mk_mux_t *mkm = calloc(1, sizeof(struct mk_mux));
+  return mkm;
+}
+
+
+/**
+ *
+ */
+int
+mk_mux_open_stream(mk_mux_t *mkm, int fd)
+{
+  mkm->filename = strdup("Live stream");
+  mkm->fd = fd;
+  mkm->cluster_maxsize = 0;
+
+  return 0;
+}
+
+
+/**
+ *
+ */
+int
+mk_mux_open_file(mk_mux_t *mkm, const char *filename)
+{
+  int fd;
+
+  fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0777);
+  if(fd < 0) {
+    mkm->error = errno;
+    tvhlog(LOG_ERR, "mkv", "%s: Unable to create file, open failed -- %s",
+	   mkm->filename, strerror(errno));
+    return mkm->error;
+  }
+
+  mkm->filename = strdup(filename);
+  mkm->fd = fd;
+  mkm->cluster_maxsize = 2000000/4;
+  mkm->seekable = 1;
+
+  return 0;
+}
+
+
+/**
+ * Init the muxer with a title and some tracks
+ */
+int
+mk_mux_init(mk_mux_t *mkm, const char *title, const struct streaming_start *ss)
+{
+  htsbuf_queue_t q;
+
+  getuuid(mkm->uuid);
+
+  if(title)
+    mkm->title = strdup(title);
+  else
+    mkm->title = strdup(mkm->filename);
+
+  TAILQ_INIT(&mkm->cues);
+
+  htsbuf_queue_init(&q, 0);
+
+  ebml_append_master(&q, 0x1a45dfa3, mk_build_ebmlheader());
+  
+  mkm->segment_header_pos = q.hq_size;
+  htsbuf_appendq(&q, mk_build_segment_header(0));
+
+  mkm->segment_pos = q.hq_size;
+  htsbuf_appendq(&q, mk_build_segment(mkm, ss));
+ 
+  mk_write_queue(mkm, &q);
+
+  return mkm->error;
+}
+
+
+/**
+ * Append a packet to the muxer
+ */
+int
+mk_mux_write_pkt(mk_mux_t *mkm, struct th_pkt *pkt)
+{
+  int i;
+  mk_track *t = NULL;
+  for(i = 0; i < mkm->ntracks;i++) {
+    if(mkm->tracks[i].index == pkt->pkt_componentindex &&
+       mkm->tracks[i].enabled) {
+      t = &mkm->tracks[i];
+      break;
+    }
+  }
+  
+  if(t != NULL && !t->disabled) {
+    if(t->merge)
+      pkt = pkt_merge_header(pkt);
+    mk_write_frame_i(mkm, t, pkt);
+  }
+  
+  pkt_ref_dec(pkt);
+
+  return mkm->error;
+}
+
+
+/**
+ * Append epg data to the muxer
+ */
+int
+mk_mux_write_meta(mk_mux_t *mkm, const dvr_entry_t *de, 
+		  const epg_broadcast_t *ebc)
+{
+  htsbuf_queue_t q;
+
+  if(!mkm->metadata_pos)
+    mkm->metadata_pos = mkm->fdpos;
+
+  htsbuf_queue_init(&q, 0);
+  ebml_append_master(&q, 0x1254c367, _mk_build_metadata(de, ebc));
+  mk_write_queue(mkm, &q);
+
+  return mkm->error;
+}
+
+
+/**
+ * Close the muxer
+ */
+int
 mk_mux_close(mk_mux_t *mkm)
 {
   int64_t totsize;
@@ -819,21 +939,42 @@ mk_mux_close(mk_mux_t *mkm)
   mk_write_metaseek(mkm, 0);
   totsize = mkm->fdpos;
 
-  // Rewrite segment info to update duration
-  if(lseek(mkm->fd, mkm->segmentinfo_pos, SEEK_SET) == mkm->segmentinfo_pos)
-    mk_write_master(mkm, 0x1549a966, mk_build_segment_info(mkm));
-  else
-    tvhlog(LOG_ERR, "MKV", "%s: Unable to write duration, seek failed -- %s",
-	   mkm->filename, strerror(errno));
+  if(mkm->seekable) {
+    // Rewrite segment info to update duration
+    if(lseek(mkm->fd, mkm->segmentinfo_pos, SEEK_SET) == mkm->segmentinfo_pos)
+      mk_write_master(mkm, 0x1549a966, mk_build_segment_info(mkm));
+    else {
+      mkm->error = errno;
+      tvhlog(LOG_ERR, "mkv", "%s: Unable to write duration, seek failed -- %s",
+	     mkm->filename, strerror(errno));
+    }
 
-  // Rewrite segment header to update total size
-  if(lseek(mkm->fd, mkm->segment_header_pos, SEEK_SET) == mkm->segment_header_pos) {
-    mk_write_segment_header(mkm, totsize - mkm->segment_header_pos - 12);
-  } else
-    tvhlog(LOG_ERR, "MKV", "%s: Unable to write total size, seek failed -- %s",
-	   mkm->filename, strerror(errno));
+    // Rewrite segment header to update total size
+    if(lseek(mkm->fd, mkm->segment_header_pos, SEEK_SET) == mkm->segment_header_pos) {
+      mk_write_segment_header(mkm, totsize - mkm->segment_header_pos - 12);
+    } else {
+      mkm->error = errno;
+      tvhlog(LOG_ERR, "mkv", "%s: Unable to write total size, seek failed -- %s",
+	     mkm->filename, strerror(errno));
+    }
 
-  close(mkm->fd);
+    if(close(mkm->fd)) {
+      mkm->error = errno;
+      tvhlog(LOG_ERR, "mkv", "%s: Unable to close the file descriptor, close failed -- %s",
+	     mkm->filename, strerror(errno));
+    }
+  }
+
+  return mkm->error;
+}
+
+
+/**
+ * Free all memory associated with the muxer.
+ */
+void
+mk_mux_destroy(mk_mux_t *mkm)
+{
   free(mkm->filename);
   free(mkm->tracks);
   free(mkm->title);

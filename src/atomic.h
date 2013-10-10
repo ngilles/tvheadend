@@ -16,13 +16,16 @@
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef HTSATOMIC_H__
-#define HTSATOMIC_H__
+#pragma once
 
-static inline int 
+static inline int
 atomic_add(volatile int *ptr, int incr)
 {
   return __sync_fetch_and_add(ptr, incr);
 }
 
-#endif /* HTSATOMIC_H__ */
+static inline int
+atomic_exchange(volatile int *ptr, int new)
+{
+  return  __sync_lock_test_and_set(ptr, new);
+}

@@ -16,17 +16,48 @@
 #  along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
-include ${CURDIR}/config.default
+#
+# Configuration
+#
 
-BUILDDIR = build.${PLATFORM}
+include ${CURDIR}/.config.mk
+PROG = ${BUILDDIR}/tvheadend
 
-include ${BUILDDIR}/config.mak
+#
+# Common compiler flags
+#
 
-PROG=${BUILDDIR}/tvheadend
+CFLAGS  += -Wall -Wwrite-strings -Wno-deprecated-declarations
+CFLAGS  += -Wmissing-prototypes -fms-extensions
+CFLAGS  += -g -funsigned-char -O2 
+CFLAGS  += -D_FILE_OFFSET_BITS=64
+CFLAGS  += -I${BUILDDIR} -I${CURDIR}/src -I${CURDIR}
+LDFLAGS += -lrt -lpthread -lssl -lz
 
-CFLAGS  = -Wall -Werror -Wwrite-strings -Wno-deprecated-declarations -I/usr/local/include
-CFLAGS += -Wmissing-prototypes
-LDFLAGS += -lrt -liconv -L/usr/local/lib
+#
+# Other config
+#
+
+BUNDLE_FLAGS-${CONFIG_ZLIB} = -z
+BUNDLE_FLAGS = ${BUNDLE_FLAGS-yes}
+
+#
+# Binaries/Scripts
+#
+
+MKBUNDLE = $(PYTHON) $(CURDIR)/support/mkbundle
+
+#
+# Debug/Output
+#
+
+ifndef V
+ECHO   = printf "$(1)\t\t%s\n" $(2)
+BRIEF  = CC MKBUNDLE CXX
+MSG    = $@
+$(foreach VAR,$(BRIEF), \
+    $(eval $(VAR) = @$$(call ECHO,$(VAR),$$(MSG)); $($(VAR))))
+endif
 
 #
 # Core
@@ -40,23 +71,23 @@ SRCS =  src/main.c \
 	src/tcp.c \
 	src/http.c \
 	src/notify.c \
+	src/file.c \
 	src/epg.c \
-	src/xmltv.c \
+	src/epgdb.c\
+	src/epggrab.c\
 	src/spawn.c \
 	src/packet.c \
 	src/streaming.c \
 	src/teletext.c \
 	src/channels.c \
 	src/subscriptions.c \
-	src/transports.c \
+	src/service.c \
 	src/psi.c \
 	src/parsers.c \
 	src/parser_h264.c \
 	src/parser_latm.c \
 	src/tsdemux.c \
 	src/bitstream.c \
-	src/rtsp.c \
-	src/rtp.c \
 	src/htsp.c \
 	src/serviceprobe.c \
 	src/htsmsg.c \
@@ -70,8 +101,22 @@ SRCS =  src/main.c \
 	src/htsstr.c \
 	src/rawtsinput.c \
 	src/iptv_input.c \
-	src/sha1.c \
+	src/avc.c \
+  src/huffman.c \
+  src/filebundle.c \
+  src/muxes.c \
+  src/config2.c \
+  src/lang_codes.c \
+  src/lang_str.c \
 
+SRCS += src/epggrab/module.c\
+  src/epggrab/channel.c\
+  src/epggrab/otamux.c\
+  src/epggrab/module/pyepg.c\
+  src/epggrab/module/xmltv.c\
+  src/epggrab/module/eit.c \
+  src/epggrab/module/opentv.c \
+  src/epggrab/support/freesat_huffman.c \
 
 SRCS += src/plumbing/tsfix.c \
 	src/plumbing/globalheaders.c \
@@ -82,130 +127,129 @@ SRCS += src/dvr/dvr_db.c \
 	src/dvr/ebml.c \
 	src/dvr/mkmux.c \
 
-SRCS-${CONFIG_LINUXDVB} += \
-	src/dvb/dvb.c \
-	src/dvb/dvb_support.c \
-	src/dvb/dvb_fe.c \
-	src/dvb/dvb_tables.c \
-	src/dvb/diseqc.c \
-	src/dvb/dvb_adapter.c \
-	src/dvb/dvb_multiplex.c \
-	src/dvb/dvb_transport.c \
-	src/dvb/dvb_preconf.c \
-	src/dvb/dvb_satconf.c \
-	src/webui/extjs_dvb.c \
-
-SRCS-${CONFIG_V4L} += \
-	src/v4l.c \
-	src/webui/extjs_v4l.c \
-
-
-#
-# cwc
-#
-SRCS += src/cwc.c \
-	src/capmt.c \
-	src/krypt.c \
-	src/ffdecsa/ffdecsa_interface.c \
-	src/ffdecsa/ffdecsa_int.c
-
-SRCS-${CONFIG_MMX}  += src/ffdecsa/ffdecsa_mmx.c
-SRCS-${CONFIG_SSE2} += src/ffdecsa/ffdecsa_sse2.c
-
-LDFLAGS += -lcrypt
-
-${BUILDDIR}/src/ffdecsa/ffdecsa_mmx.o  : CFLAGS = -mmmx
-${BUILDDIR}/src/ffdecsa/ffdecsa_sse2.o : CFLAGS = -msse2
-
-#
-# Primary web interface
-#
 SRCS += src/webui/webui.c \
 	src/webui/comet.c \
 	src/webui/extjs.c \
 	src/webui/simpleui.c \
 	src/webui/statedump.c \
+	src/webui/html.c\
+
+SRCS += src/muxer.c \
+	src/muxer_pass.c \
+	src/muxer_tvh.c \
 
 #
-# Extra modules
+# Optional code
 #
+
+# DVB
+SRCS-${CONFIG_LINUXDVB} += \
+	src/dvb/dvb.c \
+	src/dvb/dvb_support.c \
+	src/dvb/dvb_charset.c \
+	src/dvb/dvb_fe.c \
+	src/dvb/dvb_tables.c \
+	src/dvb/diseqc.c \
+	src/dvb/dvb_adapter.c \
+	src/dvb/dvb_multiplex.c \
+	src/dvb/dvb_service.c \
+	src/dvb/dvb_preconf.c \
+	src/dvb/dvb_satconf.c \
+	src/dvb/dvb_input_filtered.c \
+	src/dvb/dvb_input_raw.c \
+	src/webui/extjs_dvb.c \
+
+# V4L
+SRCS-${CONFIG_V4L} += \
+	src/v4l.c \
+	src/webui/extjs_v4l.c \
+
+# CWC
+SRCS-${CONFIG_CWC} += src/cwc.c \
+	src/capmt.c \
+	src/ffdecsa/ffdecsa_interface.c \
+	src/ffdecsa/ffdecsa_int.c
+
+# Avahi
+SRCS-$(CONFIG_AVAHI) += src/avahi.c
+
+# Optimised code
+SRCS-${CONFIG_MMX}  += src/ffdecsa/ffdecsa_mmx.c
+SRCS-${CONFIG_SSE2} += src/ffdecsa/ffdecsa_sse2.c
+${BUILDDIR}/src/ffdecsa/ffdecsa_mmx.o  : CFLAGS += -mmmx
+${BUILDDIR}/src/ffdecsa/ffdecsa_sse2.o : CFLAGS += -msse2
+
+# File bundles
+SRCS-${CONFIG_BUNDLE}     += bundle.c
+BUNDLES-yes               += docs/html docs/docresources src/webui/static
+BUNDLES-yes               += data/conf
+BUNDLES-${CONFIG_DVBSCAN} += data/dvb-scan
+BUNDLES                    = $(BUNDLES-yes)
+
+#
+# Add-on modules
+#
+
 SRCS_EXTRA = src/extra/capmt_ca.c
 
 #
-# AVAHI interface
-# 
+# Variable transformations
+#
 
-SRCS-$(CONFIG_AVAHI) += src/avahi.c
-
-${BUILDDIR}/src/avahi.o : CFLAGS = \
-                      $(shell pkg-config --cflags avahi-client) -Wall -Werror
-
-# Various transformations
-SRCS  += $(SRCS-yes)
-DLIBS += $(DLIBS-yes)
-SLIBS += $(SLIBS-yes)
-OBJS=    $(SRCS:%.c=$(BUILDDIR)/%.o)
+SRCS      += $(SRCS-yes)
+OBJS       = $(SRCS:%.c=$(BUILDDIR)/%.o)
 OBJS_EXTRA = $(SRCS_EXTRA:%.c=$(BUILDDIR)/%.so)
-DEPS=    ${OBJS:%.o=%.d}
-OBJDIRS= $(sort $(dir $(OBJS))) $(sort $(dir $(OBJS_EXTRA)))
+DEPS       = ${OBJS:%.o=%.d}
 
-# File bundles
-BUNDLE_SRCS=$(BUNDLES:%=$(BUILDDIR)/bundles/%.c)
-BUNDLE_DEPS=$(BUNDLE_SRCS:%.c=%.d)
-BUNDLE_OBJS=$(BUNDLE_SRCS:%.c=%.o)
-OBJDIRS+= $(sort $(dir $(BUNDLE_OBJS)))
-.PRECIOUS: ${BUNDLE_SRCS}
+#
+# Build Rules
+#
 
-VERSION=$(shell support/version.sh)
-CURVERSION=$(shell cat ${BUILDDIR}/ver || echo "0")
-
-# Common CFLAGS for all files
-CFLAGS_com  = -g -funsigned-char -O2 
-CFLAGS_com += -D_FILE_OFFSET_BITS=64
-CFLAGS_com += -I${BUILDDIR} -I${CURDIR}/src -I${CURDIR}
-CFLAGS_com += -DHTS_VERSION=\"$(VERSION)\"
-
+# Default
 all: ${PROG}
 
+# Special
 .PHONY:	clean distclean
 
-${PROG}: $(OBJDIRS) $(OBJS) $(BUNDLE_OBJS) Makefile
-	$(CC) -o $@ $(OBJS) $(BUNDLE_OBJS) $(LDFLAGS) ${LDFLAGS_cfg}
+# Binary
+${PROG}: $(OBJS) $(ALLDEPS)
+	$(CC) -o $@ $(OBJS) $(CFLAGS) $(LDFLAGS)
 
-$(OBJDIRS):
-	@mkdir -p $@
-
+# Object
 ${BUILDDIR}/%.o: %.c
-	$(CC) -MD $(CFLAGS_com) $(CFLAGS) $(CFLAGS_cfg) -c -o $@ $(CURDIR)/$<
+	@mkdir -p $(dir $@)
+	$(CC) -MD -MP $(CFLAGS) -c -o $@ $(CURDIR)/$<
 
+# Add-on
 ${BUILDDIR}/%.so: ${SRCS_EXTRA}
+	@mkdir -p $(dir $@)
 	${CC} -O -fbuiltin -fomit-frame-pointer -fPIC -shared -I/usr/local/include -o $@ $< -ldl
 
+# Clean
 clean:
-	rm -rf ${BUILDDIR}/src ${BUILDDIR}/bundles ${BUILDDIR}/ver
+	rm -rf ${BUILDDIR}/src ${BUILDDIR}/bundle*
 	find . -name "*~" | xargs rm -f
 
 distclean: clean
-	rm -rf build.*
+	rm -rf ${CURDIR}/build.*
+	rm -f ${CURDIR}/.config.mk
 
-ifneq ($(VERSION), $(CURVERSION))
-.PHONY:	src/version.c
-$(info Version changed)
-src/version.c:
-	echo $(VERSION) >${BUILDDIR}/ver
-endif
-
+# Create buildversion.h
+src/version.c: FORCE
+	@$(CURDIR)/support/version $@ > /dev/null
+FORCE:
 
 # Include dependency files if they exist.
--include $(DEPS) $(BUNDLE_DEPS)
+-include $(DEPS)
 
 # Include OS specific targets
 include support/${OSENV}.mk
 
 # Bundle files
-$(BUILDDIR)/bundles/%.o: $(BUILDDIR)/bundles/%.c
+$(BUILDDIR)/bundle.o: $(BUILDDIR)/bundle.c
+	@mkdir -p $(dir $@)
 	$(CC) -I${CURDIR}/src -c -o $@ $<
 
-$(BUILDDIR)/bundles/%.c: % $(CURDIR)/support/mkbundle
-	$(CURDIR)/support/mkbundle \
-		-o $@ -s $< -d ${BUILDDIR}/bundles/$<.d -p $< -z
+$(BUILDDIR)/bundle.c:
+	@mkdir -p $(dir $@)
+	$(MKBUNDLE) -o $@ -d ${BUILDDIR}/bundle.d $(BUNDLE_FLAGS) $(BUNDLES)

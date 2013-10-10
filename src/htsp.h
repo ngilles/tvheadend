@@ -24,7 +24,7 @@
 
 void htsp_init(void);
 
-void htsp_event_update(channel_t *ch, event_t *e);
+void htsp_channel_update_current(channel_t *ch);
 
 void htsp_channel_add(channel_t *ch);
 void htsp_channel_update(channel_t *ch);
@@ -37,5 +37,9 @@ void htsp_tag_delete(channel_tag_t *ct);
 void htsp_dvr_entry_add(dvr_entry_t *de);
 void htsp_dvr_entry_update(dvr_entry_t *de);
 void htsp_dvr_entry_delete(dvr_entry_t *de);
+
+void htsp_event_add(epg_broadcast_t *ebc);
+void htsp_event_update(epg_broadcast_t *ebc);
+void htsp_event_delete(epg_broadcast_t *ebc);
 
 #endif /* HTSP_H_ */

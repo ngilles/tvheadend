@@ -24,10 +24,10 @@
 
 
 static void htsstr_argsplit_add(char ***argv, int *argc, char *s);
-static int htsstr_format0(const char *str, char *out, char **map);
+static int htsstr_format0(const char *str, char *out, const char **map);
 
-static char *
-mystrndup(const char *src, size_t len)
+char *
+hts_strndup(const char *src, size_t len)
 {
   char *r = malloc(len + 1);
   r[len] = 0;
@@ -85,7 +85,7 @@ htsstr_argsplit(const char *str) {
   for(s = str; *s; s++) {
     if(start && stop) {
       htsstr_argsplit_add(&argv, &argc,
-                          htsstr_unescape(mystrndup(start, stop - start)));
+                          htsstr_unescape(hts_strndup(start, stop - start)));
       start = stop = NULL;
     }
     
@@ -131,7 +131,7 @@ htsstr_argsplit(const char *str) {
     if(!stop)
       stop = str + strlen(str);
     htsstr_argsplit_add(&argv, &argc,
-                        htsstr_unescape(mystrndup(start, stop - start)));
+                        htsstr_unescape(hts_strndup(start, stop - start)));
   }
 
   htsstr_argsplit_add(&argv, &argc, NULL);
@@ -150,9 +150,9 @@ htsstr_argsplit_free(char **argv) {
 }
 
 static int
-htsstr_format0(const char *str, char *out, char **map) {
+htsstr_format0(const char *str, char *out, const char **map) {
   const char *s = str;
-  char *f;
+  const char *f;
   int n = 0;
 
   while(*s) {
@@ -183,7 +183,7 @@ htsstr_format0(const char *str, char *out, char **map) {
 }
 
 char *
-htsstr_format(const char *str, char **map)
+htsstr_format(const char *str, const char **map)
 {
   char *s;
   

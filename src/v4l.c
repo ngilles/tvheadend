@@ -33,13 +33,13 @@
 
 #include "settings.h"
 
-#include "tvhead.h"
-#include "transports.h"
+#include "tvheadend.h"
+#include "service.h"
 #include "v4l.h"
 #include "parsers.h"
 #include "notify.h"
 #include "psi.h"
-
+#include "channels.h"
 
 struct v4l_adapter_queue v4l_adapters;
 
@@ -52,8 +52,8 @@ static void v4l_adapter_notify(v4l_adapter_t *va);
 static void
 v4l_input(v4l_adapter_t *va)
 {
-  th_transport_t *t = va->va_current_transport;
-  th_stream_t *st;
+  service_t *t = va->va_current_service;
+  elementary_stream_t *st;
   uint8_t buf[4000];
   uint8_t *ptr, *pkt;
   int len, l, r;
@@ -64,9 +64,9 @@ v4l_input(v4l_adapter_t *va)
 
   ptr = buf;
 
-  pthread_mutex_lock(&t->tht_stream_mutex);
+  pthread_mutex_lock(&t->s_stream_mutex);
 
-  transport_set_streaming_status_flags(t, 
+  service_set_streaming_status_flags(t, 
 				       TSS_INPUT_HARDWARE | TSS_INPUT_SERVICE);
 
   while(len > 0) {
@@ -79,49 +79,49 @@ v4l_input(v4l_adapter_t *va)
       continue;
 
     case 0x000001e0:
-      st = t->tht_video;
+      st = t->s_video;
       break;
     case 0x000001c0:
-      st = t->tht_audio;
+      st = t->s_audio;
       break;
     }
 
     if(va->va_lenlock == 2) {
-      l = st->st_buf_ps.sb_size;
-      st->st_buf_ps.sb_data = pkt = realloc(st->st_buf_ps.sb_data, l);
+      l = st->es_buf_ps.sb_size;
+      st->es_buf_ps.sb_data = pkt = realloc(st->es_buf_ps.sb_data, l);
       
-      r = l - st->st_buf_ps.sb_ptr;
+      r = l - st->es_buf_ps.sb_ptr;
       if(r > len)
 	r = len;
-      memcpy(pkt + st->st_buf_ps.sb_ptr, ptr, r);
+      memcpy(pkt + st->es_buf_ps.sb_ptr, ptr, r);
       
       ptr += r;
       len -= r;
 
-      st->st_buf_ps.sb_ptr += r;
-      if(st->st_buf_ps.sb_ptr == l) {
+      st->es_buf_ps.sb_ptr += r;
+      if(st->es_buf_ps.sb_ptr == l) {
 
-	transport_set_streaming_status_flags(t, TSS_MUX_PACKETS);
+	service_set_streaming_status_flags(t, TSS_MUX_PACKETS);
 
 	parse_mpeg_ps(t, st, pkt + 6, l - 6);
 
-	st->st_buf_ps.sb_size = 0;
+	st->es_buf_ps.sb_size = 0;
 	va->va_startcode = 0;
       } else {
-	assert(st->st_buf_ps.sb_ptr < l);
+	assert(st->es_buf_ps.sb_ptr < l);
       }
       
     } else {
-      st->st_buf_ps.sb_size = st->st_buf_ps.sb_size << 8 | *ptr;
+      st->es_buf_ps.sb_size = st->es_buf_ps.sb_size << 8 | *ptr;
       va->va_lenlock++;
       if(va->va_lenlock == 2) {
-	st->st_buf_ps.sb_size += 6;
-	st->st_buf_ps.sb_ptr = 6;
+	st->es_buf_ps.sb_size += 6;
+	st->es_buf_ps.sb_ptr = 6;
       }
       ptr++; len--;
     }
   }
-  pthread_mutex_unlock(&t->tht_stream_mutex);
+  pthread_mutex_unlock(&t->s_stream_mutex);
 }
 
 
@@ -170,16 +170,16 @@ v4l_thread(void *aux)
  *
  */
 static int
-v4l_transport_start(th_transport_t *t, unsigned int weight, int force_start)
+v4l_service_start(service_t *t, unsigned int weight, int force_start)
 {
-  v4l_adapter_t *va = t->tht_v4l_adapter;
-  int frequency = t->tht_v4l_frequency;
+  v4l_adapter_t *va = t->s_v4l_adapter;
+  int frequency = t->s_v4l_frequency;
   struct v4l2_frequency vf;
   int result;
   v4l2_std_id std = 0xff;
   int fd;
 
-  if(va->va_current_transport != NULL)
+  if(va->va_current_service != NULL)
     return 1; // Adapter busy
 
   fd = tvh_open(va->va_path, O_RDWR | O_NONBLOCK, 0);
@@ -218,14 +218,14 @@ v4l_transport_start(th_transport_t *t, unsigned int weight, int force_start)
   }
   if(pipe(va->va_pipe)) {
     tvhlog(LOG_ERR, "v4l",
-	   "%s: Unable to create control pipe", va->va_path, strerror(errno));
+	   "%s: Unable to create control pipe [%s]", va->va_path, strerror(errno));
     close(fd);
     return -1;
   }
 
 
   va->va_fd = fd;
-  va->va_current_transport = t;
+  va->va_current_service = t;
   pthread_create(&va->va_thread, NULL, v4l_thread, va);
   v4l_adapter_notify(va);
   return 0;
@@ -236,7 +236,7 @@ v4l_transport_start(th_transport_t *t, unsigned int weight, int force_start)
  *
  */
 static void
-v4l_transport_refresh(th_transport_t *t)
+v4l_service_refresh(service_t *t)
 {
 
 }
@@ -246,12 +246,12 @@ v4l_transport_refresh(th_transport_t *t)
  *
  */
 static void
-v4l_transport_stop(th_transport_t *t)
+v4l_service_stop(service_t *t)
 {
   char c = 'q';
-  v4l_adapter_t *va = t->tht_v4l_adapter;
+  v4l_adapter_t *va = t->s_v4l_adapter;
 
-  assert(va->va_current_transport != NULL);
+  assert(va->va_current_service != NULL);
 
   if(write(va->va_pipe[1], &c, 1) != 1)
     tvhlog(LOG_ERR, "v4l", "Unable to close video thread -- %s",
@@ -262,7 +262,7 @@ v4l_transport_stop(th_transport_t *t)
   close(va->va_pipe[1]);
   close(va->va_fd);
 
-  va->va_current_transport = NULL;
+  va->va_current_service = NULL;
   v4l_adapter_notify(va);
 }
 
@@ -271,25 +271,25 @@ v4l_transport_stop(th_transport_t *t)
  *
  */
 static void
-v4l_transport_save(th_transport_t *t)
+v4l_service_save(service_t *t)
 {
-  v4l_adapter_t *va = t->tht_v4l_adapter;
+  v4l_adapter_t *va = t->s_v4l_adapter;
   htsmsg_t *m = htsmsg_create_map();
 
-  htsmsg_add_u32(m, "frequency", t->tht_v4l_frequency);
+  htsmsg_add_u32(m, "frequency", t->s_v4l_frequency);
   
-  if(t->tht_ch != NULL) {
-    htsmsg_add_str(m, "channelname", t->tht_ch->ch_name);
+  if(t->s_ch != NULL) {
+    htsmsg_add_str(m, "channelname", t->s_ch->ch_name);
     htsmsg_add_u32(m, "mapped", 1);
   }
   
 
-  pthread_mutex_lock(&t->tht_stream_mutex);
-  psi_save_transport_settings(m, t);
-  pthread_mutex_unlock(&t->tht_stream_mutex);
+  pthread_mutex_lock(&t->s_stream_mutex);
+  psi_save_service_settings(m, t);
+  pthread_mutex_unlock(&t->s_stream_mutex);
   
   hts_settings_save(m, "v4lservices/%s/%s",
-		    va->va_identifier, t->tht_identifier);
+		    va->va_identifier, t->s_identifier);
 
   htsmsg_destroy(m);
 }
@@ -299,7 +299,7 @@ v4l_transport_save(th_transport_t *t)
  *
  */
 static int
-v4l_transport_quality(th_transport_t *t)
+v4l_service_quality(service_t *t)
 {
   return 100;
 }
@@ -309,7 +309,7 @@ v4l_transport_quality(th_transport_t *t)
  *
  */
 static int
-v4l_grace_period(th_transport_t *t)
+v4l_grace_period(service_t *t)
 {
   return 2;
 }
@@ -319,14 +319,15 @@ v4l_grace_period(th_transport_t *t)
  * Generate a descriptive name for the source
  */
 static void
-v4l_transport_setsourceinfo(th_transport_t *t, struct source_info *si)
+v4l_service_setsourceinfo(service_t *t, struct source_info *si)
 {
   char buf[64];
   memset(si, 0, sizeof(struct source_info));
 
-  si->si_adapter = strdup(t->tht_v4l_adapter->va_displayname);
+  si->si_type = S_MPEG_PS;
+  si->si_adapter = strdup(t->s_v4l_adapter->va_displayname);
 
-  snprintf(buf, sizeof(buf), "%d Hz", t->tht_v4l_frequency);
+  snprintf(buf, sizeof(buf), "%d Hz", t->s_v4l_frequency);
   si->si_mux = strdup(buf);
 }
 
@@ -334,10 +335,10 @@ v4l_transport_setsourceinfo(th_transport_t *t, struct source_info *si)
 /**
  *
  */
-th_transport_t *
-v4l_transport_find(v4l_adapter_t *va, const char *id, int create)
+service_t *
+v4l_service_find(v4l_adapter_t *va, const char *id, int create)
 {
-  th_transport_t *t;
+  service_t *t;
   char buf[200];
 
   int vaidlen = strlen(va->va_identifier);
@@ -347,8 +348,8 @@ v4l_transport_find(v4l_adapter_t *va, const char *id, int create)
     if(strncmp(id, va->va_identifier, vaidlen))
       return NULL;
 
-    LIST_FOREACH(t, &va->va_transports, tht_group_link)
-      if(!strcmp(t->tht_identifier, id))
+    LIST_FOREACH(t, &va->va_services, s_group_link)
+      if(!strcmp(t->s_identifier, id))
 	return t;
   }
 
@@ -363,25 +364,25 @@ v4l_transport_find(v4l_adapter_t *va, const char *id, int create)
     va->va_tally = MAX(atoi(id + vaidlen + 1), va->va_tally);
   }
 
-  t = transport_create(id, TRANSPORT_V4L, 0);
+  t = service_create(id, SERVICE_TYPE_V4L, 0);
 
-  t->tht_start_feed    = v4l_transport_start;
-  t->tht_refresh_feed  = v4l_transport_refresh;
-  t->tht_stop_feed     = v4l_transport_stop;
-  t->tht_config_save   = v4l_transport_save;
-  t->tht_setsourceinfo = v4l_transport_setsourceinfo;
-  t->tht_quality_index = v4l_transport_quality;
-  t->tht_grace_period  = v4l_grace_period;
-  t->tht_iptv_fd = -1;
-  t->tht_v4l_adapter = va;
+  t->s_start_feed    = v4l_service_start;
+  t->s_refresh_feed  = v4l_service_refresh;
+  t->s_stop_feed     = v4l_service_stop;
+  t->s_config_save   = v4l_service_save;
+  t->s_setsourceinfo = v4l_service_setsourceinfo;
+  t->s_quality_index = v4l_service_quality;
+  t->s_grace_period  = v4l_grace_period;
+  t->s_iptv_fd = -1;
+  t->s_v4l_adapter = va;
 
-  pthread_mutex_lock(&t->tht_stream_mutex); 
-  transport_make_nicename(t);
-  t->tht_video = transport_stream_create(t, -1, SCT_MPEG2VIDEO); 
-  t->tht_audio = transport_stream_create(t, -1, SCT_MPEG2AUDIO); 
-  pthread_mutex_unlock(&t->tht_stream_mutex); 
+  pthread_mutex_lock(&t->s_stream_mutex); 
+  service_make_nicename(t);
+  t->s_video = service_stream_create(t, -1, SCT_MPEG2VIDEO); 
+  t->s_audio = service_stream_create(t, -1, SCT_MPEG2AUDIO); 
+  pthread_mutex_unlock(&t->s_stream_mutex); 
 
-  LIST_INSERT_HEAD(&va->va_transports, t, tht_group_link);
+  LIST_INSERT_HEAD(&va->va_services, t, s_group_link);
 
   return t;
 }
@@ -455,7 +456,7 @@ v4l_adapter_check(const char *path, int fd)
       break;
 
     tvhlog(LOG_INFO, "v4l", 
-	   "%s: Standard #%d: %016llx %s, frameperiod: %d/%d, %d lines",
+	   "%s: Standard #%d: %016lx %s, frameperiod: %d/%d, %d lines",
 	   path,
 	   standard.index, 
 	   standard.id,
@@ -491,7 +492,7 @@ v4l_adapter_check(const char *path, int fd)
     int f = input.status;
 
     tvhlog(LOG_INFO, "v4l", 
-	   "%s: Input #%d: %s (%s), audio:0x%x, tuner:%d, standard:%016llx, "
+	   "%s: Input #%d: %s (%s), audio:0x%x, tuner:%d, standard:%016lx, "
 	   "%s%s%s",
 	   path,
 	   input.index,
@@ -524,7 +525,7 @@ v4l_adapter_check(const char *path, int fd)
 	   path,
 	   fmtdesc.index,
 	   fmtdesc.description,
-	   &fmtdesc.pixelformat,
+	   (char*)&fmtdesc.pixelformat,
 	   fmtdesc.flags & V4L2_FMT_FLAG_COMPRESSED ? "(compressed)" : "");
 
     if(fmtdesc.pixelformat == V4L2_PIX_FMT_MPEG)
@@ -614,10 +615,10 @@ v4l_adapter_build_msg(v4l_adapter_t *va)
   if(va->va_devicename)
     htsmsg_add_str(m, "devicename", va->va_devicename);
 
-  if(va->va_current_transport != NULL) {
+  if(va->va_current_service != NULL) {
     char buf[100];
     snprintf(buf, sizeof(buf), "%d Hz", 
-	     va->va_current_transport->tht_v4l_frequency);
+	     va->va_current_service->s_v4l_frequency);
     htsmsg_add_str(m, "currentMux", buf);
   } else {
     htsmsg_add_str(m, "currentMux", "- inactive -");
@@ -702,7 +703,7 @@ v4l_service_create_by_msg(v4l_adapter_t *va, htsmsg_t *c, const char *name)
   const char *s;
   unsigned int u32;
 
-  th_transport_t *t = v4l_transport_find(va, name, 1);
+  service_t *t = v4l_service_find(va, name, 1);
 
   if(t == NULL)
     return;
@@ -712,10 +713,10 @@ v4l_service_create_by_msg(v4l_adapter_t *va, htsmsg_t *c, const char *name)
     u32 = 0;
   
   if(!htsmsg_get_u32(c, "frequency", &u32))
-    t->tht_v4l_frequency = u32;
+    t->s_v4l_frequency = u32;
 
   if(s && u32)
-    transport_map_channel(t, channel_find_by_name(s, 1, 0), 0);
+    service_map_channel(t, channel_find_by_name(s, 1, 0), 0);
 }
 
 /**

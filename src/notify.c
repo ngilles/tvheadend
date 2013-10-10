@@ -22,7 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "tvhead.h"
+#include "tvheadend.h"
 #include "notify.h"
 #include "webui/webui.h"
 
@@ -32,4 +32,13 @@ notify_by_msg(const char *class, htsmsg_t *m)
   htsmsg_add_str(m, "notificationClass", class);
   comet_mailbox_add_message(m, 0);
   htsmsg_destroy(m);
+}
+
+
+void
+notify_reload(const char *class)
+{
+  htsmsg_t *m = htsmsg_create_map();
+  htsmsg_add_u32(m, "reload", 1);
+  notify_by_msg(class, m);
 }

@@ -21,12 +21,14 @@
 #ifndef HTSSTR_H__
 #define HTSSTR_H__
 
+char *hts_strndup(const char *str, size_t len);
+
 char *htsstr_unescape(char *str);
 
 char **htsstr_argsplit(const char *str);
 
 void htsstr_argsplit_free(char **argv);
 
-char *htsstr_format(const char *str, char **map);
+char *htsstr_format(const char *str, const char **map);
 
 #endif /* HTSSTR_H__ */

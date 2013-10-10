@@ -36,7 +36,7 @@
 #include <arpa/inet.h>
 
 #include "tcp.h"
-#include "tvhead.h"
+#include "tvheadend.h"
 
 
 /**
@@ -184,18 +184,18 @@ int
 tcp_write_queue(int fd, htsbuf_queue_t *q)
 {
   htsbuf_data_t *hd;
-  int l, r;
+  int l, r = 0;
 
   while((hd = TAILQ_FIRST(&q->hq_q)) != NULL) {
     TAILQ_REMOVE(&q->hq_q, hd, hd_link);
 
     l = hd->hd_data_len - hd->hd_data_off;
-    r = write(fd, hd->hd_data + hd->hd_data_off, l);
+    r |= !!write(fd, hd->hd_data + hd->hd_data_off, l);
     free(hd->hd_data);
     free(hd);
   }
   q->hq_size = 0;
-  return 0;
+  return r;
 }
 
 
@@ -373,6 +373,7 @@ static void *
 tcp_server_start(void *aux)
 {
   tcp_server_launch_t *tsl = aux;
+  struct timeval to;
   int val;
 
   val = 1;
@@ -396,6 +397,9 @@ tcp_server_start(void *aux)
   val = 1;
   setsockopt(tsl->fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
 
+  to.tv_sec  = 30;
+  to.tv_usec =  0;
+  setsockopt(tsl->fd, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof(to));
 
   tsl->start(tsl->fd, tsl->opaque, &tsl->peer, &tsl->self);
   free(tsl);

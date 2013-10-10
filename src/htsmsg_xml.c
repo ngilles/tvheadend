@@ -1,6 +1,6 @@
 /*
  *  Functions converting HTSMSGs to/from XML
- *  Copyright (C) 2008 Andreas Öman
+ *  Copyright (C) 2008 Andreas ï¿½man
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -50,7 +50,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "tvhead.h"
+#include "tvheadend.h"
 
 #include "htsmsg_xml.h"
 #include "htsbuf.h"
@@ -637,7 +637,7 @@ htsmsg_xml_parse_cd0(xmlparser_t *xp,
     }
 
     if(cc == NULL) {
-      if(*src <= 32) {
+      if(*src < 32) {
 	src++;
 	continue;
       }
@@ -693,7 +693,7 @@ htsmsg_xml_parse_cd(xmlparser_t *xp, htsmsg_t *parent, char *src)
     }
   }
 
-  if(y == 1 && c > 1) {
+  if(y == 1 && c > 0) {
     /* One segment UTF-8 (or 7bit ASCII),
        use data directly from source */
 
@@ -707,7 +707,7 @@ htsmsg_xml_parse_cd(xmlparser_t *xp, htsmsg_t *parent, char *src)
     *cc->cc_end = 0;
     free(cc);
 
-  } else if(c > 1) {
+  } else if(c > 0) {
     body = malloc(c + 1);
     c = 0;
 
@@ -864,4 +864,47 @@ htsmsg_xml_deserialize(char *src, char *errbuf, size_t errbufsize)
   }
 
   return NULL;
+}
+
+/*
+ * Get cdata string field
+ */
+const char *
+htsmsg_xml_get_cdata_str(htsmsg_t *tags, const char *name)
+{
+  htsmsg_t *sub;
+  if((sub = htsmsg_get_map(tags, name)) == NULL)
+    return NULL;
+  return htsmsg_get_str(sub, "cdata");
+}
+
+/*
+ * Get cdata u32 field
+ */
+int
+htsmsg_xml_get_cdata_u32(htsmsg_t *tags, const char *name, uint32_t *u32)
+{
+  htsmsg_t *sub;
+  if((sub = htsmsg_get_map(tags, name)) == NULL)
+    return HTSMSG_ERR_FIELD_NOT_FOUND;
+  return htsmsg_get_u32(sub, "cdata", u32);
+}
+
+/*
+ * Get tag attribute
+ */
+const char *
+htsmsg_xml_get_attr_str ( htsmsg_t *tag, const char *name )
+{
+  htsmsg_t *attr = htsmsg_get_map(tag, "attrib");
+  if (attr) return htsmsg_get_str(attr, name);
+  return NULL;
+}
+
+int
+htsmsg_xml_get_attr_u32 ( htsmsg_t *tag, const char *name, uint32_t *ret )
+{
+  htsmsg_t *attr = htsmsg_get_map(tag, "attrib");
+  if (attr) return htsmsg_get_u32(attr, name, ret);
+  return HTSMSG_ERR_FIELD_NOT_FOUND;
 }

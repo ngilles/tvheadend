@@ -42,19 +42,32 @@
 #define DVB_DESC_SHORT_EVENT  0x4d
 #define DVB_DESC_EXT_EVENT    0x4e
 #define DVB_DESC_SERVICE      0x48
+#define DVB_DESC_COMPONENT    0x50
 #define DVB_DESC_CONTENT      0x54
+#define DVB_DESC_PARENTAL_RAT 0x55
 #define DVB_DESC_TELETEXT     0x56
 #define DVB_DESC_SUBTITLE     0x59
 #define DVB_DESC_AC3          0x6a
+#define DVB_DESC_DEF_AUTHORITY 0x73
+#define DVB_DESC_CRID         0x76
 #define DVB_DESC_EAC3         0x7a
 #define DVB_DESC_AAC          0x7c
 #define DVB_DESC_LOCAL_CHAN   0x83
 
+typedef struct dvb_string_conv
+{
+  uint8_t type;
+  size_t  (*func) ( char *dst, size_t *dstlen,
+                    const uint8_t* src, size_t srclen );
+} dvb_string_conv_t;
+
 int dvb_get_string(char *dst, size_t dstlen, const uint8_t *src, 
-		   const size_t srclen);
+		   const size_t srclen, const char *dvb_charset,
+       dvb_string_conv_t *conv);
 
 int dvb_get_string_with_len(char *dst, size_t dstlen, 
-			    const uint8_t *buf, size_t buflen);
+			    const uint8_t *buf, size_t buflen, const char *dvb_charset,
+          dvb_string_conv_t *conv);
 
 #define bcdtoint(i) ((((i & 0xf0) >> 4) * 10) + (i & 0x0f))
 
@@ -69,7 +82,6 @@ th_dvb_mux_instance_t *dvb_mux_find_by_identifier(const char *identifier);
 void dvb_mux_nicename(char *buf, size_t size, th_dvb_mux_instance_t *tdmi);
 int dvb_mux_badness(th_dvb_mux_instance_t *tdmi);
 const char *dvb_mux_status(th_dvb_mux_instance_t *tdmi);
-void dvb_conversion_init(void);
 void dvb_mux_nicefreq(char *buf, size_t size, th_dvb_mux_instance_t *tdmi);
 
 void atsc_utf16_to_utf8(uint8_t *src, int len, char *buf, int buflen);

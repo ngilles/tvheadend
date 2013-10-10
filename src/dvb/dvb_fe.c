@@ -33,13 +33,52 @@
 #include <linux/dvb/frontend.h>
 #include <linux/dvb/dmx.h>
 
-#include "tvhead.h"
+#include "tvheadend.h"
 #include "dvb.h"
 #include "dvb_support.h"
 #include "diseqc.h"
 #include "notify.h"
-#include "transports.h"
 #include "dvr/dvr.h"
+#include "service.h"
+#include "streaming.h"
+
+#include "epggrab.h"
+
+/**
+ * Return uncorrected block (since last read)
+ *
+ * Some adapters report delta themselfs, some return ever increasing value
+ * we need to deal with that ourselfs
+ */
+static int
+dvb_fe_get_unc(th_dvb_adapter_t *tda)
+{
+  uint32_t fec;
+  int d, r;
+
+  if(ioctl(tda->tda_fe_fd, FE_READ_UNCORRECTED_BLOCKS, &fec))
+    return 0; // read failed, just say 0
+
+  if(tda->tda_unc_is_delta)
+    return fec;
+
+  d = (int)fec - (int)tda->tda_last_fec;
+
+  if(d < 0) {
+    tda->tda_unc_is_delta = 1;
+    tvhlog(LOG_DEBUG, "dvb",
+	   "%s: FE_READ_UNCORRECTED_BLOCKS returns delta updates (delta=%d)",
+	   tda->tda_displayname, d);
+    return fec;
+  }
+  
+  r = fec - tda->tda_last_fec;
+
+  tda->tda_last_fec = fec;
+  return r;
+}
+
+
 
 /**
  * Front end monitor
@@ -54,6 +93,9 @@ dvb_fe_monitor(void *aux)
   int status, v, update = 0, vv, i, fec, q;
   th_dvb_mux_instance_t *tdmi = tda->tda_mux_current;
   char buf[50];
+  signal_status_t sigstat;
+  streaming_message_t sm;
+  struct service *t;
 
   gtimer_arm(&tda->tda_fe_monitor_timer, dvb_fe_monitor, tda, 1);
 
@@ -80,7 +122,7 @@ dvb_fe_monitor(void *aux)
     if(status == -1) { /* We have a lock, don't hold off */
       tda->tda_fe_monitor_hold = 0; 
       /* Reset FEC counter */
-      ioctl(tda->tda_fe_fd, FE_READ_UNCORRECTED_BLOCKS, &fec);
+      dvb_fe_get_unc(tda);
     } else {
       tda->tda_fe_monitor_hold--;
       return;
@@ -90,8 +132,7 @@ dvb_fe_monitor(void *aux)
   if(status == -1) {
     /* Read FEC counter (delta) */
 
-    if(ioctl(tda->tda_fe_fd, FE_READ_UNCORRECTED_BLOCKS, &fec))
-      fec = 0;
+    fec = dvb_fe_get_unc(tda);
     
     tdmi->tdmi_fec_err_histogram[tdmi->tdmi_fec_err_ptr++] = fec;
     if(tdmi->tdmi_fec_err_ptr == TDMI_FEC_ERR_HISTOGRAM_SIZE)
@@ -158,6 +199,22 @@ dvb_fe_monitor(void *aux)
 
     dvb_mux_save(tdmi);
   }
+
+  /* Streaming message */
+  sigstat.status_text = dvb_mux_status(tdmi);
+  sigstat.snr         = tdmi->tdmi_snr;
+  sigstat.signal      = tdmi->tdmi_signal;
+  sigstat.ber         = tdmi->tdmi_ber;
+  sigstat.unc         = tdmi->tdmi_uncorrected_blocks;
+  sm.sm_type = SMT_SIGNAL_STATUS;
+  sm.sm_data = &sigstat;
+  LIST_FOREACH(t, &tda->tda_transports, s_active_link)
+    if(t->s_dvb_mux_instance == tda->tda_mux_current && t->s_status == SERVICE_RUNNING ) {
+      pthread_mutex_lock(&t->s_stream_mutex);
+      streaming_pad_deliver(&t->s_streaming_pad, &sm);
+      pthread_mutex_unlock(&t->s_stream_mutex);
+    }
+
 }
 
 
@@ -165,26 +222,19 @@ dvb_fe_monitor(void *aux)
  * Stop the given TDMI
  */
 void
-dvb_fe_stop(th_dvb_mux_instance_t *tdmi)
+dvb_fe_stop(th_dvb_mux_instance_t *tdmi, int retune)
 {
   th_dvb_adapter_t *tda = tdmi->tdmi_adapter;
+
+  lock_assert(&global_lock);
 
   assert(tdmi == tda->tda_mux_current);
   tda->tda_mux_current = NULL;
 
-  if(tda->tda_allpids_dmx_fd != -1) {
-    close(tda->tda_allpids_dmx_fd);
-    tda->tda_allpids_dmx_fd = -1;
-  }
-
-  if(tda->tda_dump_fd != -1) {
-    close(tda->tda_dump_fd);
-    tda->tda_dump_fd = -1;
-  }
-
   if(tdmi->tdmi_table_initial) {
     tdmi->tdmi_table_initial = 0;
     tda->tda_initial_num_mux--;
+    dvb_mux_save(tdmi);
   }
 
   dvb_table_flush_all(tdmi);
@@ -192,85 +242,18 @@ dvb_fe_stop(th_dvb_mux_instance_t *tdmi)
   assert(tdmi->tdmi_scan_queue == NULL);
 
   if(tdmi->tdmi_enabled) {
-    tdmi->tdmi_scan_queue = &tda->tda_scan_queues[tdmi->tdmi_quality == 100];
-    TAILQ_INSERT_TAIL(tdmi->tdmi_scan_queue, tdmi, tdmi_scan_link);
+    dvb_mux_add_to_scan_queue(tdmi);
   }
-
+  
+  epggrab_mux_stop(tdmi, 0);
+  
   time(&tdmi->tdmi_lost_adapter);
+
+  if (!retune) {
+    gtimer_disarm(&tda->tda_fe_monitor_timer);
+    dvb_adapter_stop(tda);
+  }
 }
-
-
-/**
- * Open a dump file which we write the entire mux output to
- */
-static void
-dvb_adapter_open_dump_file(th_dvb_adapter_t *tda)
-{
-  struct dmx_pes_filter_params dmx_param;
-  char fullname[1000];
-  char path[500];
-  const char *fname = tda->tda_mux_current->tdmi_identifier;
-
-  int fd = tvh_open(tda->tda_demux_path, O_RDWR, 0);
-  if(fd == -1)
-    return;
-
-  memset(&dmx_param, 0, sizeof(dmx_param));
-  dmx_param.pid = 0x2000;
-  dmx_param.input = DMX_IN_FRONTEND;
-  dmx_param.output = DMX_OUT_TS_TAP;
-  dmx_param.pes_type = DMX_PES_OTHER;
-  dmx_param.flags = DMX_IMMEDIATE_START;
-  
-  if(ioctl(fd, DMX_SET_PES_FILTER, &dmx_param)) {
-    tvhlog(LOG_ERR, "dvb",
-	   "\"%s\" unable to configure demuxer \"%s\" for all PIDs -- %s",
-	   fname, tda->tda_demux_path, 
-	   strerror(errno));
-    close(fd);
-    return;
-  }
-
-  snprintf(path, sizeof(path), "%s/muxdumps", 
-      dvr_config_find_by_name_default("")->dvr_storage);
-
-  if(mkdir(path, 0777) && errno != EEXIST) {
-    tvhlog(LOG_ERR, "dvb", "\"%s\" unable to create mux dump dir %s -- %s",
-	   fname, path, strerror(errno));
-    close(fd);
-    return;
-  }
-
-  int attempt = 1;
-
-  while(1) {
-    struct stat st;
-    snprintf(fullname, sizeof(fullname), "%s/%s.dump%d.ts",
-	     path, fname, attempt);
-
-    if(stat(fullname, &st) == -1)
-      break;
-    
-    attempt++;
-  }
-  
-  int f = open(fullname, O_CREAT | O_TRUNC | O_WRONLY, 0777);
-
-  if(f == -1) {
-    tvhlog(LOG_ERR, "dvb", "\"%s\" unable to create mux dump file %s -- %s",
-	   fname, fullname, strerror(errno));
-    close(fd);
-    return;
-  }
-	   
-  tvhlog(LOG_WARNING, "dvb", "\"%s\" writing to mux dump file %s",
-	 fname, fullname);
-
-  tda->tda_allpids_dmx_fd = fd;
-  tda->tda_dump_fd = f;
-}
-
-
 
 #if DVB_API_VERSION >= 5
 
@@ -278,7 +261,7 @@ static int check_frontend (int fe_fd, int dvr, int human_readable) {
   (void)dvr;
   fe_status_t status;
   uint16_t snr, signal;
-  uint32_t ber, uncorrected_blocks;
+  uint32_t ber;
   int timeout = 0;
 
   do {
@@ -293,15 +276,13 @@ static int check_frontend (int fe_fd, int dvr, int human_readable) {
       snr = -2;
     if (ioctl(fe_fd, FE_READ_BER, &ber) == -1)
       ber = -2;
-    if (ioctl(fe_fd, FE_READ_UNCORRECTED_BLOCKS, &uncorrected_blocks) == -1)
-      uncorrected_blocks = -2;
 
     if (human_readable) {
-      printf ("status %02x | signal %3u%% | snr %3u%% | ber %d | unc %d | ",
-          status, (signal * 100) / 0xffff, (snr * 100) / 0xffff, ber, uncorrected_blocks);
+      printf ("status %02x | signal %3u%% | snr %3u%% | ber %d | ",
+          status, (signal * 100) / 0xffff, (snr * 100) / 0xffff, ber);
     } else {
-      printf ("status %02x | signal %04x | snr %04x | ber %08x | unc %08x | ",
-          status, signal, snr, ber, uncorrected_blocks);
+      printf ("status %02x | signal %04x | snr %04x | ber %08x | ",
+          status, signal, snr, ber);
     }
     if (status & FE_HAS_LOCK)
       printf("FE_HAS_LOCK");
@@ -403,42 +384,55 @@ dvb_fe_tune(th_dvb_mux_instance_t *tdmi, const char *reason)
   }
 
   if(tda->tda_mux_current != NULL)
-    dvb_fe_stop(tda->tda_mux_current);
-
-    
+    dvb_fe_stop(tda->tda_mux_current, 1);
+  else
+    dvb_adapter_start(tda);
+      
   if(tda->tda_type == FE_QPSK) {
 	
     /* DVB-S */
     dvb_satconf_t *sc;
-    int port, lowfreq, hifreq, switchfreq, hiband, pol;
+    int port, lowfreq, hifreq, switchfreq, hiband, pol, dbsbs;
 
     lowfreq = 9750000;
     hifreq = 10600000;
     switchfreq = 11700000;
     port = 0;
+    dbsbs = 0;
 
     if((sc = tdmi->tdmi_conf.dmc_satconf) != NULL) {
       port = sc->sc_port;
 
       if(sc->sc_lnb != NULL)
       	dvb_lnb_get_frequencies(sc->sc_lnb, &lowfreq, &hifreq, &switchfreq);
+      if(!strcmp(sc->sc_id ?: "", "DBS Bandstacked"))
+        dbsbs = 1;
     }
 
-    hiband = switchfreq && p->frequency > switchfreq;
-
-    pol = tdmi->tdmi_conf.dmc_polarisation;
-    if ((r = diseqc_setup(tda->tda_fe_fd,
-		 port,
-		 pol == POLARISATION_HORIZONTAL ||
-		 pol == POLARISATION_CIRCULAR_LEFT,
-		 hiband, tda->tda_diseqc_version)) != 0)
+    if(dbsbs) {
+      hiband = 0;
+      if(tdmi->tdmi_conf.dmc_polarisation == POLARISATION_HORIZONTAL ||
+         tdmi->tdmi_conf.dmc_polarisation == POLARISATION_CIRCULAR_LEFT)
+        p->frequency = abs(p->frequency - hifreq);
+      else
+        p->frequency = abs(p->frequency - lowfreq);
+      pol = POLARISATION_CIRCULAR_LEFT;
+    } else {
+      hiband = switchfreq && p->frequency > switchfreq;
+      pol = tdmi->tdmi_conf.dmc_polarisation;
+      if(hiband)
+        p->frequency = abs(p->frequency - hifreq);
+      else
+        p->frequency = abs(p->frequency - lowfreq);
+    }
+ 
+    if ((r = diseqc_setup(tda->tda_fe_fd, port,
+                          pol == POLARISATION_HORIZONTAL ||
+                          pol == POLARISATION_CIRCULAR_LEFT,
+                          hiband, tda->tda_diseqc_version,
+                          tda->tda_diseqc_repeats)) != 0)
       tvhlog(LOG_ERR, "dvb", "diseqc setup failed %d\n", r);
-      
-    if(hiband)
-      p->frequency = abs(p->frequency - hifreq);
-    else
-      p->frequency = abs(p->frequency - lowfreq);
-  }
+    }
 
   dvb_mux_nicename(buf, sizeof(buf), tdmi);
 
@@ -448,9 +442,9 @@ dvb_fe_tune(th_dvb_mux_instance_t *tdmi, const char *reason)
 #if DVB_API_VERSION >= 5
   if (tda->tda_type == FE_QPSK) {
     tvhlog(LOG_DEBUG, "dvb", "\"%s\" tuning via s2api to \"%s\" (%d, %d Baud, "
-	    "%s, %s, %s)", tda->tda_rootpath, buf, p->frequency, p->u.qpsk.symbol_rate, 
+	    "%s, %s, %s) for %s", tda->tda_rootpath, buf, p->frequency, p->u.qpsk.symbol_rate, 
       dvb_mux_fec2str(p->u.qpsk.fec_inner), dvb_mux_delsys2str(dmc.dmc_fe_delsys), 
-      dvb_mux_qam2str(dmc.dmc_fe_modulation));
+      dvb_mux_qam2str(dmc.dmc_fe_modulation), reason);
   
     r = dvb_fe_tune_s2(tdmi, &dmc);
   } else
@@ -462,19 +456,27 @@ dvb_fe_tune(th_dvb_mux_instance_t *tdmi, const char *reason)
 
   if(r != 0) {
     tvhlog(LOG_ERR, "dvb", "\"%s\" tuning to \"%s\""
-     " -- Front configuration failed -- %s, frequency: %ld",
+     " -- Front configuration failed -- %s, frequency: %u",
      tda->tda_rootpath, buf, strerror(errno), p->frequency);
+
+    /* Remove from initial scan set */
+    if(tdmi->tdmi_table_initial) {
+      tdmi->tdmi_table_initial = 0;
+      tda->tda_initial_num_mux--;
+    }
+
+    /* Mark as bad */
+    dvb_mux_set_enable(tdmi, 0);
     return SM_CODE_TUNING_FAILED;
   }   
 
   tda->tda_mux_current = tdmi;
 
-  if(tda->tda_dump_muxes)
-    dvb_adapter_open_dump_file(tda);
-
   gtimer_arm(&tda->tda_fe_monitor_timer, dvb_fe_monitor, tda, 1);
 
+
   dvb_table_add_default(tdmi);
+  epggrab_mux_start(tdmi);
 
   dvb_adapter_notify(tda);
   return 0;

@@ -25,16 +25,15 @@
 
 #include "htsstr.h"
 
-#include "tvhead.h"
+#include "tvheadend.h"
 #include "streaming.h"
 #include "dvr.h"
 #include "spawn.h"
-#include "transports.h"
-
+#include "service.h"
 #include "plumbing/tsfix.h"
 #include "plumbing/globalheaders.h"
 
-#include "mkmux.h"
+#include "muxer.h"
 
 /**
  *
@@ -60,26 +59,39 @@ dvr_rec_subscribe(dvr_entry_t *de)
 {
   char buf[100];
   int weight;
+  streaming_target_t *st;
+  int flags;
 
   assert(de->de_s == NULL);
-
-  snprintf(buf, sizeof(buf), "DVR: %s", de->de_title);
-
-  streaming_queue_init(&de->de_sq, 0);
-
-  pthread_create(&de->de_thread, NULL, dvr_thread, de);
 
   if(de->de_pri < 5)
     weight = prio2weight[de->de_pri];
   else
     weight = 300;
 
-  de->de_gh = globalheaders_create(&de->de_sq.sq_st);
+  snprintf(buf, sizeof(buf), "DVR: %s", lang_str_get(de->de_title, NULL));
 
-  de->de_tsfix = tsfix_create(de->de_gh);
+  if(de->de_mc == MC_PASS) {
+    streaming_queue_init(&de->de_sq, SMT_PACKET);
+    de->de_gh = NULL;
+    de->de_tsfix = NULL;
+    st = &de->de_sq.sq_st;
+    flags = SUBSCRIPTION_RAW_MPEGTS;
+  } else {
+    streaming_queue_init(&de->de_sq, 0);
+    de->de_gh = globalheaders_create(&de->de_sq.sq_st);
+    de->de_tsfix = tsfix_create(de->de_gh);
+    st = de->de_tsfix;
+    flags = 0;
+  }
 
   de->de_s = subscription_create_from_channel(de->de_channel, weight,
-					      buf, de->de_tsfix, 0);
+					      buf, st, flags,
+					      NULL, "DVR",
+					      lang_str_get(de->de_title,
+							   NULL));
+
+  pthread_create(&de->de_thread, NULL, dvr_thread, de);
 }
 
 /**
@@ -97,8 +109,11 @@ dvr_rec_unsubscribe(dvr_entry_t *de, int stopcode)
   pthread_join(de->de_thread, NULL);
   de->de_s = NULL;
 
-  tsfix_destroy(de->de_tsfix);
-  globalheaders_destroy(de->de_gh);
+  if(de->de_tsfix)
+    tsfix_destroy(de->de_tsfix);
+
+  if(de->de_gh)
+    globalheaders_destroy(de->de_gh);
 
   de->de_last_error = stopcode;
 }
@@ -178,17 +193,17 @@ cleanupfilename(char *s, int dvr_flags)
  *
  */
 static int
-pvr_generate_filename(dvr_entry_t *de)
+pvr_generate_filename(dvr_entry_t *de, const streaming_start_t *ss)
 {
   char fullname[1000];
   char path[500];
   int tally = 0;
   struct stat st;
-  char *filename;
+  char filename[1000];
   struct tm tm;
   dvr_config_t *cfg = dvr_config_find_by_name_default(de->de_config_name);
 
-  filename = strdup(de->de_ititle);
+  dvr_make_title(filename, sizeof(filename), de);
   cleanupfilename(filename,cfg->dvr_flags);
 
   snprintf(path, sizeof(path), "%s", cfg->dvr_storage);
@@ -214,11 +229,13 @@ pvr_generate_filename(dvr_entry_t *de)
     free(chname);
   }
 
+  // TODO: per-brand, per-season
+
   /* Append per-title directory */
 
   if(cfg->dvr_flags & DVR_DIR_PER_TITLE) {
 
-    char *title = strdup(de->de_title);
+    char *title = strdup(lang_str_get(de->de_title, NULL));
     cleanupfilename(title,cfg->dvr_flags);
     snprintf(path + strlen(path), sizeof(path) - strlen(path), 
 	     "/%s", title);
@@ -227,14 +244,15 @@ pvr_generate_filename(dvr_entry_t *de)
 
 
   /* */
-  if(makedirs(path) != 0)
+  if(makedirs(path) != 0) {
     return -1;
+  }
   
 
   /* Construct final name */
   
   snprintf(fullname, sizeof(fullname), "%s/%s.%s",
-	   path, filename, cfg->dvr_file_postfix);
+	   path, filename, muxer_suffix(de->de_mux, ss));
 
   while(1) {
     if(stat(fullname, &st) == -1) {
@@ -249,12 +267,11 @@ pvr_generate_filename(dvr_entry_t *de)
     tally++;
 
     snprintf(fullname, sizeof(fullname), "%s/%s-%d.%s",
-	     path, filename, tally, cfg->dvr_file_postfix);
+	     path, filename, tally, muxer_suffix(de->de_mux, ss));
   }
 
   tvh_str_set(&de->de_filename, fullname);
 
-  free(filename);
   return 0;
 }
 
@@ -274,7 +291,7 @@ dvr_rec_fatal_error(dvr_entry_t *de, const char *fmt, ...)
 
   tvhlog(LOG_ERR, "dvr", 
 	 "Recording error: \"%s\": %s",
-	 de->de_filename ?: de->de_title, msgbuf);
+	 de->de_filename ?: lang_str_get(de->de_title, NULL), msgbuf);
 }
 
 
@@ -284,19 +301,25 @@ dvr_rec_fatal_error(dvr_entry_t *de, const char *fmt, ...)
 static void
 dvr_rec_set_state(dvr_entry_t *de, dvr_rs_state_t newstate, int error)
 {
-  if(de->de_rec_state == newstate)
-    return;
-  de->de_rec_state = newstate;
-  de->de_last_error = error;
-  if(error)
-    de->de_errors++;
-  dvr_entry_notify(de);
+  int notify = 0;
+  if(de->de_rec_state != newstate) {
+    de->de_rec_state = newstate;
+    notify = 1;
+  }
+  if(de->de_last_error != error) {
+    de->de_last_error = error;
+    notify = 1;
+    if(error)
+      de->de_errors++;
+  }
+  if (notify)
+    dvr_entry_notify(de);
 }
 
 /**
  *
  */
-static void
+static int
 dvr_rec_start(dvr_entry_t *de, const streaming_start_t *ss)
 {
   const source_info_t *si = &ss->ss_si;
@@ -304,24 +327,39 @@ dvr_rec_start(dvr_entry_t *de, const streaming_start_t *ss)
   int i;
   dvr_config_t *cfg = dvr_config_find_by_name_default(de->de_config_name);
 
-  if(pvr_generate_filename(de) != 0) {
-    dvr_rec_fatal_error(de, "Unable to create directories");
-    return;
+  de->de_mux = muxer_create(de->de_mc);
+  if(!de->de_mux) {
+    dvr_rec_fatal_error(de, "Unable to create muxer");
+    return -1;
   }
 
-  de->de_mkmux = mk_mux_create(de->de_filename, ss, de, 
-			       !!(cfg->dvr_flags & DVR_TAG_FILES));
+  if(pvr_generate_filename(de, ss) != 0) {
+    dvr_rec_fatal_error(de, "Unable to create directories");
+    return -1;
+  }
 
-  if(de->de_mkmux == NULL) {
+  if(muxer_open_file(de->de_mux, de->de_filename)) {
     dvr_rec_fatal_error(de, "Unable to open file");
-    return;
+    return -1;
+  }
+
+  if(muxer_init(de->de_mux, ss, lang_str_get(de->de_title, NULL))) {
+    dvr_rec_fatal_error(de, "Unable to init file");
+    return -1;
+  }
+
+  if(cfg->dvr_flags & DVR_TAG_FILES) {
+    if(muxer_write_meta(de->de_mux, de->de_bcast)) {
+      dvr_rec_fatal_error(de, "Unable to write meta data");
+      return -1;
+    }
   }
 
   tvhlog(LOG_INFO, "dvr", "%s from "
 	 "adapter: \"%s\", "
 	 "network: \"%s\", mux: \"%s\", provider: \"%s\", "
 	 "service: \"%s\"",
-	 de->de_ititle,
+	 de->de_filename ?: lang_str_get(de->de_title, NULL),
 	 si->si_adapter  ?: "<N/A>",
 	 si->si_network  ?: "<N/A>",
 	 si->si_mux      ?: "<N/A>",
@@ -374,6 +412,8 @@ dvr_rec_start(dvr_entry_t *de, const streaming_start_t *ss)
 	   ch,
 	   ssc->ssc_disabled ? "<disabled, no valid input>" : "");
   }
+
+  return 0;
 }
 
 
@@ -387,6 +427,7 @@ dvr_thread(void *aux)
   streaming_queue_t *sq = &de->de_sq;
   streaming_message_t *sm;
   int run = 1;
+  int started = 0;
 
   pthread_mutex_lock(&sq->sq_mutex);
 
@@ -402,21 +443,28 @@ dvr_thread(void *aux)
     pthread_mutex_unlock(&sq->sq_mutex);
 
     switch(sm->sm_type) {
+    case SMT_MPEGTS:
     case SMT_PACKET:
       if(dispatch_clock > de->de_start - (60 * de->de_start_extra)) {
 	dvr_rec_set_state(de, DVR_RS_RUNNING, 0);
-	if(de->de_mkmux != NULL) {
-	  mk_mux_write_pkt(de->de_mkmux, sm->sm_data);
-	  sm->sm_data = NULL;
-	}
+
+	muxer_write_pkt(de->de_mux, sm->sm_type, sm->sm_data);
+	sm->sm_data = NULL;
       }
       break;
 
     case SMT_START:
-      pthread_mutex_lock(&global_lock);
-      dvr_rec_set_state(de, DVR_RS_WAIT_PROGRAM_START, 0);
-      dvr_rec_start(de, sm->sm_data);
-      pthread_mutex_unlock(&global_lock);
+      if(!started) {
+	pthread_mutex_lock(&global_lock);
+	dvr_rec_set_state(de, DVR_RS_WAIT_PROGRAM_START, 0);
+	if(dvr_rec_start(de, sm->sm_data) == 0)
+	  started = 1;
+	pthread_mutex_unlock(&global_lock);
+      } else if(muxer_reconfigure(de->de_mux, sm->sm_data) < 0) {
+	tvhlog(LOG_WARNING,
+	       "dvr", "Unable to reconfigure the recording \"%s\"",
+	       de->de_filename ?: lang_str_get(de->de_title, NULL));
+      }
       break;
 
     case SMT_STOP:
@@ -428,16 +476,15 @@ dvr_thread(void *aux)
 
 	tvhlog(LOG_INFO, 
 	       "dvr", "Recording completed: \"%s\"",
-	       de->de_filename ?: de->de_title);
+	       de->de_filename ?: lang_str_get(de->de_title, NULL));
 
-      } else {
-
+      } else if(sm->sm_code != SM_CODE_SOURCE_RECONFIGURED) {
 	if(de->de_last_error != sm->sm_code) {
 	  dvr_rec_set_state(de, DVR_RS_ERROR, sm->sm_code);
 
 	  tvhlog(LOG_ERR,
 		 "dvr", "Recording stopped: \"%s\": %s",
-		 de->de_filename ?: de->de_title,
+		 de->de_filename ?: lang_str_get(de->de_title, NULL),
 		 streaming_code2txt(sm->sm_code));
 	}
       }
@@ -445,7 +492,7 @@ dvr_thread(void *aux)
       dvr_thread_epilog(de);
       break;
 
-    case SMT_TRANSPORT_STATUS:
+    case SMT_SERVICE_STATUS:
       if(sm->sm_code & TSS_PACKETS) {
 	
       } else if(sm->sm_code & (TSS_GRACEPERIOD | TSS_ERRORS)) {
@@ -463,7 +510,7 @@ dvr_thread(void *aux)
 	  dvr_rec_set_state(de, DVR_RS_ERROR, code);
 	  tvhlog(LOG_ERR,
 		 "dvr", "Streaming error: \"%s\": %s",
-		 de->de_filename ?: de->de_title,
+		 de->de_filename ?: lang_str_get(de->de_title, NULL),
 		 streaming_code2txt(code));
 	}
       }
@@ -472,16 +519,16 @@ dvr_thread(void *aux)
     case SMT_NOSTART:
 
       if(de->de_last_error != sm->sm_code) {
-	dvr_rec_set_state(de, DVR_RS_ERROR, sm->sm_code);
+	dvr_rec_set_state(de, DVR_RS_PENDING, sm->sm_code);
 
 	tvhlog(LOG_ERR,
 	       "dvr", "Recording unable to start: \"%s\": %s",
-	       de->de_filename ?: de->de_title,
+	       de->de_filename ?: lang_str_get(de->de_title, NULL),
 	       streaming_code2txt(sm->sm_code));
       }
       break;
 
-    case SMT_MPEGTS:
+    case SMT_SIGNAL_STATUS:
       break;
 
     case SMT_EXIT:
@@ -503,7 +550,7 @@ dvr_thread(void *aux)
 static void
 dvr_spawn_postproc(dvr_entry_t *de, const char *dvr_postproc)
 {
-  char *fmap[256];
+  const char *fmap[256];
   char **args;
   char start[16];
   char stop[16];
@@ -526,12 +573,13 @@ dvr_spawn_postproc(dvr_entry_t *de, const char *dvr_postproc)
   fmap['b'] = basename(fbasename); /* basename of recoding */
   fmap['c'] = de->de_channel->ch_name; /* channel name */
   fmap['C'] = de->de_creator; /* user who created this recording */
-  fmap['t'] = de->de_title; /* program title */
-  fmap['d'] = de->de_desc; /* program description */
+  fmap['t'] = lang_str_get(de->de_title, NULL); /* program title */
+  fmap['d'] = lang_str_get(de->de_desc, NULL); /* program description */
   /* error message, empty if no error (FIXME:?) */
   fmap['e'] = tvh_strdupa(streaming_code2txt(de->de_last_error));
   fmap['S'] = start; /* start time, unix epoch */
   fmap['E'] = stop; /* stop time, unix epoch */
+  // TODO: brand, season
 
   /* format arguments */
   for(i = 0; args[i]; i++) {
@@ -554,8 +602,9 @@ dvr_spawn_postproc(dvr_entry_t *de, const char *dvr_postproc)
 static void
 dvr_thread_epilog(dvr_entry_t *de)
 {
-  mk_mux_close(de->de_mkmux);
-  de->de_mkmux = NULL;
+  muxer_close(de->de_mux);
+  muxer_destroy(de->de_mux);
+  de->de_mux = NULL;
 
   dvr_config_t *cfg = dvr_config_find_by_name_default(de->de_config_name);
   if(cfg->dvr_postproc)

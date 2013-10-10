@@ -17,9 +17,10 @@
  */
 
 #include <assert.h>
-#include "tvhead.h"
+#include "tvheadend.h"
 #include "streaming.h"
 #include "globalheaders.h"
+#include "avc.h"
 
 typedef struct globalheaders {
   streaming_target_t gh_input;
@@ -78,6 +79,7 @@ apply_header(streaming_start_component_t *ssc, th_pkt_t *pkt)
     return;
 
   switch(ssc->ssc_type) {
+  case SCT_MP4A:
   case SCT_AAC:
     ssc->ssc_gh = pktbuf_alloc(NULL, 2);
     d = pktbuf_ptr(ssc->ssc_gh);
@@ -121,6 +123,7 @@ header_complete(streaming_start_component_t *ssc, int not_so_picky)
   if(ssc->ssc_gh == NULL &&
      (ssc->ssc_type == SCT_H264 ||
       ssc->ssc_type == SCT_MPEG2VIDEO ||
+      ssc->ssc_type == SCT_MP4A ||
       ssc->ssc_type == SCT_AAC))
     return 0;
   return 1;
@@ -164,7 +167,7 @@ convertpkt(streaming_start_component_t *ssc, th_pkt_t *pkt)
 {
   switch(ssc->ssc_type) {
   case SCT_H264:
-    //    return avc_convert_pkt(pkt);
+    return avc_convert_pkt(pkt);
 
   default:
     return pkt;
@@ -201,6 +204,12 @@ gh_hold(globalheaders_t *gh, streaming_message_t *sm)
     ssc = streaming_start_component_find_by_index(gh->gh_ss, 
 						  pkt->pkt_componentindex);
     assert(ssc != NULL);
+
+    if(ssc->ssc_type == SCT_TELETEXT) {
+      free(sm);
+      ssc->ssc_disabled = 1;
+      break;
+    }
 
     pkt = convertpkt(ssc, pkt);
 
@@ -242,7 +251,8 @@ gh_hold(globalheaders_t *gh, streaming_message_t *sm)
     break;
 
   case SMT_EXIT:
-  case SMT_TRANSPORT_STATUS:
+  case SMT_SERVICE_STATUS:
+  case SMT_SIGNAL_STATUS:
   case SMT_NOSTART:
   case SMT_MPEGTS:
     streaming_target_deliver2(gh->gh_output, sm);
@@ -269,7 +279,8 @@ gh_pass(globalheaders_t *gh, streaming_message_t *sm)
     gh_flush(gh);
     // FALLTHRU
   case SMT_EXIT:
-  case SMT_TRANSPORT_STATUS:
+  case SMT_SERVICE_STATUS:
+  case SMT_SIGNAL_STATUS:
   case SMT_NOSTART:
   case SMT_MPEGTS:
     streaming_target_deliver2(gh->gh_output, sm);

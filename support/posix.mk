@@ -1,16 +1,19 @@
+MAN = man/tvheadend.1
+ICON = support/gnome/tvheadend.svg
 
-prefix ?= $(INSTALLPREFIX)
-INSTBIN= $(prefix)/bin
-INSTMAN= $(prefix)/share/man1
-MAN=man/tvheadend.1
+INSTICON= ${DESTDIR}$(prefix)/share/icons/hicolor/scalable/apps
+
 
 install: ${PROG} ${MAN}
-	mkdir -p ${DESTDIR}$(INSTBIN)
-	install -s ${PROG} ${DESTDIR}$(INSTBIN)
+	install -D ${PROG} ${DESTDIR}${bindir}/tvheadend
+	install -D ${MAN} ${DESTDIR}${mandir}/tvheadend.1
 
-	mkdir -p ${DESTDIR}$(INSTMAN)
-	install ${MAN} ${DESTDIR}$(INSTMAN)
+	for bundle in ${BUNDLES}; do \
+		mkdir -p ${DESTDIR}${datadir}/tvheadend/$$bundle ;\
+		cp -r $$bundle/*  ${DESTDIR}${datadir}/tvheadend/$$bundle ;\
+	done
+
 
 uninstall:
-	rm -f ${DESTDIR}$(INSTBIN)/${PROG}
-	rm -f ${DESTDIR}$(INSTMAN)/${MAN}
+	rm -f ${DESTDIR}${bindir)/tvheadend
+	rm -f ${DESTDIR}${mandir)/tvheadend.1

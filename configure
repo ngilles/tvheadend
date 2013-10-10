@@ -1,164 +1,139 @@
 #!/bin/bash
 #
-# HTS configure script
+# Tvheadend configure script
 #
-# Copyright (c) 2005-2009 Andreas Öman
-#
-# Based on FFmpeg's configure script:
-#
-# Copyright (c) 2000-2002 Fabrice Bellard
-# Copyright (c) 2005-2008 Diego Biurrun
-# Copyright (c) 2005-2008 Mans Rullgard
+# Copyright (c) 2012 Adam Sutton <dev@adamsutton.me.uk>
 #
 
-PLATFORM=`uname`
+# ###########################################################################
+# Setup
+# ###########################################################################
 
-source support/configure.inc
-
-CPU=generic
-ARCH=`uname -m`
-OSENV="posix"
-PREFIX=/usr/local
-
-show_help(){
-  echo "Usage: configure [options]"
-  echo "Options: [defaults in brackets after descriptions]"
-  echo
-  echo "Standard options:"
-  echo "  --help                   print this message"
-  echo "  --prefix=PREFIX          install in PREFIX [$PREFIX]"
-  echo "  --arch=arch              Build for this architecture [$ARCH]"
-  echo "  --cpu=cpu                Build and optimize for specific CPU"
-  echo "  --cc=CC                  Build using the given compiler"
-  echo "  --release                Stage for release"
-  exit 1
-}
-
-enable cwc
-enable avahi
-enable linuxdvb
-enable v4l
-
-for opt do
-  optval="${opt#*=}"
-  case "$opt" in
-  --prefix=*) PREFIX="$optval"
-  ;;
-  --cpu=*) CPU="$optval"
-  ;;
-  --help) show_help
-  ;;
-  --release) 
-	  RELEASE=yes
-  ;;
-  --cc=*) CC="$optval"
-  ;;
-  --enable-?*|--disable-?*)
-  eval $(echo "$opt" | sed 's/--/action=/;s/-/ option=/;s/-/_/g')
-  $action $option
-  ;;
-  esac
-done
-
-
-setup_env
-
+ROOTDIR=$(dirname $0)
 
 #
-# c compiler
+# Options
 #
 
-checkcc() {
-    cat >$TMPDIR/1.c <<EOF
-int main() {
- return 0;
-}
-EOF
-    $CC 2>/dev/null $TMPDIR/1.c -o $TMPDIR/1.bin 
-}
+OPTIONS=(
+  "cwc:yes"
+  "v4l:yes"
+  "linuxdvb:yes"
+  "dvbscan:yes"
+  "avahi:auto"
+  "zlib:auto"
+  "bundle:no"
+)
 
+#
+# Begin
+#
 
-checkccarg() {
-    cat >$TMPDIR/1.c <<EOF
-int main() {
- return 0;
-}
-EOF
-    $CC 2>/dev/null $TMPDIR/1.c -o $TMPDIR/1.bin $1
-}
-    
+. $ROOTDIR/support/configure.inc
+parse_args $*
 
-if [ "x$CC" != "x" ]; then
-    echo >${CONFIG_MAK} "CC=$CC"
+# ###########################################################################
+# Checks
+# ###########################################################################
+
+#
+# Compiler
+#
+check_cc || die 'No C compiler found'
+check_cc_header execinfo
+check_cc_option mmx
+check_cc_option sse2
+
+check_cc_snippet getloadavg '#include <stdlib.h> 
+void test() { getloadavg(NULL,0); }'
+
+#
+# Python
+#
+check_py || echo 'WARN: no python binary found'
+check_py_import gzip
+
+#
+# Binaries
+#
+check_bin bzip2 || echo 'WARN: no bzip2 binary found'
+
+#
+# SSL
+#
+if check_pkg openssl || check_pkg libssl; then
+  enable ssl
 else
-    CC=cc
+  enable ssl
+  # die "SSL development support not found"
 fi
-
-if checkcc; then 
-    echo "Using C compiler:      $CC"
-else
-    echo "C compiler ($CC) is not working"
-    die
-fi
-
-
-if checkccarg "-mmmx"; then
-   enable mmx
-fi
-
-if checkccarg "-msse2"; then
-   enable sse2
-fi
-
-echo >>${CONFIG_MAK} $CC_CONFIG_MAK 
 
 #
-# AVAHI
+# Gzip
 #
-if enabled avahi; then
-    if pkg-config avahi-client; then
-	# CFLAGS are included by Makefile
-	echo >>${CONFIG_MAK} "LDFLAGS_cfg += " `pkg-config --libs avahi-client`
-	echo "Using AVAHI client:    `pkg-config --modversion avahi-client`"
-    else
-	echo "avahi-client not found. Unable to build with AVAHI support."
-	echo "To compile without it, configure with: --disable-avahi"
-	die
+if enabled_or_auto zlib; then
+  if check_pkg zlib; then
+    enable zlib
+  elif enabled zlib; then
+    enable zlib
+    # die "Zlib development support not found (use --disable-zlib)"
+  fi
+fi
+enable zlib
+
+#
+# Bundling
+#
+if enabled bundle; then
+  if enabled zlib && ! enabled py_gzip; then
+    die "Python gzip module not found (use --disable-zlib or --disable-bundle)"
+  fi
+fi
+
+#
+# Avahi
+#
+if enabled_or_auto avahi; then
+  if check_pkg avahi-client; then
+    enable avahi
+  elif enabled avahi; then
+    die "Avahi development support not found (use --disable-avahi)"
+  fi
+fi
+
+#
+# DVB scan
+#
+if enabled linuxdvb && enabled dvbscan; then
+  if [ ! -d ${ROOTDIR}/data/dvb-scan ]; then
+    if ! enabled bin_bzip2; then
+      die "Bzip2 not found, fetch dvb-scan files (use --disable-dvbscan)"
     fi
+    echo -n "Fetching dvb-scan files... "
+    if ${ROOTDIR}/support/getmuxlist &> /dev/null; then
+      echo "done"
+    else
+      echo
+      die "Failed to fetch dvb-scan files (use --disable-dvbscan to skip)"
+    fi
+  fi
 fi
 
-#
-# Configure paths, etc
-#
-if [ ${RELEASE} != yes ]; then
-    echo  NOTE:
-    echo  NOTE: Development build. 
-    echo  NOTE: The generated binary will contained compild-in paths to
-    echo  NOTE: the current build tree. If you plan to install or move 
-    echo  NOTE: the binary, please reconfigure with '--release'.
-    echo  NOTE:
+# ###########################################################################
+# Write config
+# ###########################################################################
 
-    cat >> ${CONFIG_H} << EOF
-#define TVHEADEND_CONTENT_PATH "${TOPDIR}"
+# Write config
+write_config
+cat >> ${CONFIG_H} <<EOF
+#define TVHEADEND_DATADIR "$(eval echo ${datadir})/tvheadend"
 EOF
 
-else
-
-    echo >>${CONFIG_MAK} "BUNDLES += docs/html docs/docresources src/webui/static"
-
-    cat >> ${CONFIG_H} << EOF
-#define TVHEADEND_CONTENT_PATH NULL
-EOF
-fi
-
-#
-# Finalize
-#
-cat >> ${CONFIG_MAK} << EOF 
-ARCH=$ARCH
-INSTALLPREFIX=$PREFIX
-LDFLAGS_cfg += -lpthread
-EOF
-
-
-finalize
+# Output config
+print_config
+echo "Final Binary:"
+echo "  $BUILDDIR/tvheadend"
+echo ""
+echo "Tvheadend Data Directory:"
+echo "  $(eval echo ${datadir}/tvheadend)"
+echo ""

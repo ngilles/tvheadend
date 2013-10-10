@@ -37,13 +37,17 @@ htsmsg_json_encode_string(const char *str, htsbuf_queue_t *hq)
   htsbuf_append(hq, "\"", 1);
 
   while(*s != 0) {
-    if(*s == '"' || *s == '\\' || *s == '\n') {
+    if(*s == '"' || *s == '\\' || *s == '\n' || *s == '\t' || *s == '\r') {
       htsbuf_append(hq, str, s - str);
 
       if(*s == '"')
 	htsbuf_append(hq, "\\\"", 2);
       else if(*s == '\n') 
 	htsbuf_append(hq, "\\n", 2);
+      else if(*s == '\t') 
+	htsbuf_append(hq, "\\t", 2);
+      else if(*s == '\r')
+	htsbuf_append(hq, "\\r", 2);
       else
 	htsbuf_append(hq, "\\\\", 2);
       s++;
@@ -160,7 +164,11 @@ htsmsg_json_parse_string(const char *s, const char **endp)
 
     if(*s == '\\') {
       esc = 1;
-    } else if(*s == '"' && s[-1] != '\\') {
+      /* skip the escape */
+      s++;
+      if (*s == 'u') s += 4;
+      // Note: we could detect the lack of support here!
+    } else if(*s == '"') {
 
       *endp = s + 1;
 
@@ -180,6 +188,8 @@ htsmsg_json_parse_string(const char *s, const char **endp)
 	    a++;
 	    if(*a == 'b')
 	      *b++ = '\b';
+      else if(*a == '\\')
+        *b++ = '\\';
 	    else if(*a == 'f')
 	      *b++ = '\f';
 	    else if(*a == 'n')
@@ -229,7 +239,10 @@ htsmsg_json_parse_object(const char *s, const char **endp)
 
   r = htsmsg_create_map();
   
-  while(1) {
+  while(*s > 0 && *s < 33)
+    s++;
+
+  if(*s != '}') while(1) {
 
     if((name = htsmsg_json_parse_string(s, &s2)) == NULL) {
       htsmsg_destroy(r);

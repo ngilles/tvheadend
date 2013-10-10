@@ -17,14 +17,14 @@
  */
 
 
-#include "tvhead.h"
+#include "tvheadend.h"
 #include "dvb.h"
 #include "dvb_support.h"
+#include "dvb_charset.h"
 
 void
-dvb_init(uint32_t adapter_mask)
+dvb_init(uint32_t adapter_mask, const char *rawfile)
 {
-  dvb_adapter_init(adapter_mask);
-  dvb_conversion_init();
-
+  dvb_charset_init();
+  dvb_adapter_init(adapter_mask, rawfile);
 }

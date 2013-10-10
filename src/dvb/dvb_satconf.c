@@ -28,7 +28,7 @@
 #include <linux/dvb/frontend.h>
 #include <linux/dvb/dmx.h>
 
-#include "tvhead.h"
+#include "tvheadend.h"
 #include "dvb.h"
 #include "dtable.h"
 #include "notify.h"
@@ -218,6 +218,7 @@ static const dtable_class_t satconf_dtc = {
   .dtc_record_delete  = satconf_entry_delete,
   .dtc_read_access    = ACCESS_ADMIN,
   .dtc_write_access   = ACCESS_ADMIN,
+  .dtc_mutex = &global_lock,
 };
 
 
@@ -260,7 +261,7 @@ dvb_satconf_list(th_dvb_adapter_t *tda)
   TAILQ_FOREACH(sc, &tda->tda_satconfs, sc_adapter_link) {
     m = htsmsg_create_map();
     htsmsg_add_str(m, "identifier", sc->sc_id);
-    htsmsg_add_str(m, "name", sc->sc_name);
+    htsmsg_add_str(m, "name", sc->sc_name ?: "");
     htsmsg_add_msg(array, NULL, m);
   }
   return array;
@@ -289,11 +290,13 @@ dvb_lnblist_get(void)
 
   add_to_lnblist(array, "Universal");
   add_to_lnblist(array, "DBS");
+  add_to_lnblist(array, "DBS Bandstacked");
   add_to_lnblist(array, "Standard");
   add_to_lnblist(array, "Enhanced");
   add_to_lnblist(array, "C-Band");
   add_to_lnblist(array, "C-Multi");
   add_to_lnblist(array, "Circular 10750");
+  add_to_lnblist(array, "Ku 11300");
   return array;
 }
 
@@ -311,6 +314,10 @@ dvb_lnb_get_frequencies(const char *id, int *f_low, int *f_hi, int *f_switch)
   } else if(!strcmp(id, "DBS")) {
     *f_low    = 11250000;
     *f_hi     = 0;
+    *f_switch = 0;
+  } else if(!strcmp(id, "DBS Bandstacked")) {
+    *f_low    = 11250000;
+    *f_hi     = 14350000;
     *f_switch = 0;
   } else if(!strcmp(id, "Standard")) {
     *f_low    = 10000000;
@@ -330,6 +337,10 @@ dvb_lnb_get_frequencies(const char *id, int *f_low, int *f_hi, int *f_switch)
     *f_switch = 0;
   } else if(!strcmp(id, "Circular 10750")) {
     *f_low    = 10750000;
+    *f_hi     = 0;
+    *f_switch = 0;
+  } else if(!strcmp(id, "Ku 11300")) {
+    *f_low    = 11300000;
     *f_hi     = 0;
     *f_switch = 0;
   }

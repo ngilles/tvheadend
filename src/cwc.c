@@ -26,27 +26,29 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
 #include <ctype.h>
-#include <rpc/des_crypt.h>
 
-#include "tvhead.h"
+#include "tvheadend.h"
 #include "tcp.h"
 #include "psi.h"
 #include "tsdemux.h"
 #include "ffdecsa/FFdecsa.h"
-#include "transports.h"
 #include "cwc.h"
 #include "notify.h"
 #include "atomic.h"
 #include "dtable.h"
+#include "subscriptions.h"
+
+#include <openssl/des.h>
 
 /**
  *
  */
-
+#define TVHEADEND_PROTOCOL_ID 0x6502
 #define CWC_KEEPALIVE_INTERVAL 30
 
-#define CWS_NETMSGSIZE 256
+#define CWS_NETMSGSIZE 362
 #define CWS_FIRSTCMDNO 0xe0
 
 /**
@@ -54,8 +56,14 @@
  */
 typedef enum {
   CARD_IRDETO,
+  CARD_DRE,
   CARD_CONAX,
   CARD_SECA,
+  CARD_VIACCESS,
+  CARD_NAGRA,
+  CARD_NDS,
+  CARD_CRYPTOWORKS,
+  CARD_BULCRYPT,
   CARD_UNKNOWN
 } card_type_t;
 
@@ -87,11 +95,13 @@ typedef enum {
  *
  */
 TAILQ_HEAD(cwc_queue, cwc);
-LIST_HEAD(cwc_transport_list, cwc_transport);
+LIST_HEAD(cwc_service_list, cwc_service);
 TAILQ_HEAD(cwc_message_queue, cwc_message);
 LIST_HEAD(ecm_section_list, ecm_section);
 static struct cwc_queue cwcs;
 static pthread_cond_t cwc_config_changed;
+static pthread_mutex_t cwc_mutex;
+static char *crypt_md5(const char *pw, const char *salt);
 
 /**
  *
@@ -126,42 +136,43 @@ typedef struct ecm_pid {
 /**
  *
  */
-typedef struct cwc_transport {
-  th_descrambler_t ct_head;
+typedef struct cwc_service {
+  th_descrambler_t cs_head;
 
-  th_transport_t *ct_transport;
+  service_t *cs_service;
 
-  struct cwc *ct_cwc;
+  struct cwc *cs_cwc;
 
-  LIST_ENTRY(cwc_transport) ct_link;
+  LIST_ENTRY(cwc_service) cs_link;
 
-  int ct_okchannel;
+  int cs_okchannel;
 
   /**
-   * Status of the key(s) in ct_keys
+   * Status of the key(s) in cs_keys
    */
   enum {
-    CT_UNKNOWN,
-    CT_RESOLVED,
-    CT_FORBIDDEN
-  } ct_keystate;
+    CS_UNKNOWN,
+    CS_RESOLVED,
+    CS_FORBIDDEN,
+    CS_IDLE
+  } cs_keystate;
 
-  void *ct_keys;
+  void *cs_keys;
 
 
-  uint8_t ct_cw[16];
-  int ct_pending_cw_update;
+  uint8_t cs_cw[16];
+  int cs_pending_cw_update;
 
   /**
    * CSA
    */
-  int ct_cluster_size;
-  uint8_t *ct_tsbcluster;
-  int ct_fill;
+  int cs_cluster_size;
+  uint8_t *cs_tsbcluster;
+  int cs_fill;
 
-  LIST_HEAD(, ecm_pid) ct_pids;
+  LIST_HEAD(, ecm_pid) cs_pids;
 
-} cwc_transport_t;
+} cwc_service_t;
 
 
 /**
@@ -198,15 +209,15 @@ typedef struct cwc {
   int cwc_writer_running;
   struct cwc_message_queue cwc_writeq;
 
-  TAILQ_ENTRY(cwc) cwc_link; /* Linkage protected via global_lock */
+  TAILQ_ENTRY(cwc) cwc_link; /* Linkage protected via cwc_mutex */
 
-  struct cwc_transport_list cwc_transports;
+  struct cwc_service_list cwc_services;
 
   uint16_t cwc_caid;
 
   int cwc_seq;
 
-  uint8_t cwc_key[16];
+  DES_key_schedule cwc_k1, cwc_k2;
 
   uint8_t cwc_buf[256];
   int cwc_bufptr;
@@ -220,6 +231,28 @@ typedef struct cwc {
 
   /* Emm forwarding */
   int cwc_forward_emm;
+
+  /* Emm duplicate cache */
+  struct {
+#define EMM_CACHE_SIZE (1<<5)
+#define EMM_CACHE_MASK (EMM_CACHE_SIZE-1)
+    uint32_t cache[EMM_CACHE_SIZE];
+    uint32_t w;
+    uint32_t n;
+  } cwc_emm_cache;
+
+  /* Viaccess EMM assemble state */
+  struct {
+    int shared_toggle;
+    int shared_len;
+    uint8_t * shared_emm;
+    void *ca_update_id;
+  } cwc_viaccess_emm;
+#define cwc_cryptoworks_emm cwc_viaccess_emm
+
+  /* one update id */
+  int64_t cwc_update_time;
+  void *cwc_update_id;
 
   /* Card type */
   card_type_t cwc_card_type;
@@ -235,6 +268,7 @@ typedef struct cwc {
   int cwc_port;
   char *cwc_id;
   int cwc_emm;
+  int cwc_emmex;
 
   const char *cwc_errtxt;
 
@@ -248,12 +282,18 @@ typedef struct cwc {
  *
  */
 
-static void cwc_transport_destroy(th_descrambler_t *td);
-extern char *cwc_krypt(const char *key, const char *salt);
+static void cwc_service_destroy(th_descrambler_t *td);
 static void cwc_detect_card_type(cwc_t *cwc);
 void cwc_emm_conax(cwc_t *cwc, uint8_t *data, int len);
 void cwc_emm_irdeto(cwc_t *cwc, uint8_t *data, int len);
+void cwc_emm_dre(cwc_t *cwc, uint8_t *data, int len);
 void cwc_emm_seca(cwc_t *cwc, uint8_t *data, int len);
+void cwc_emm_viaccess(cwc_t *cwc, uint8_t *data, int len);
+void cwc_emm_nagra(cwc_t *cwc, uint8_t *data, int len);
+void cwc_emm_nds(cwc_t *cwc, uint8_t *data, int len);
+void cwc_emm_cryptoworks(cwc_t *cwc, uint8_t *data, int len);
+void cwc_emm_bulcrypt(cwc_t *cwc, uint8_t *data, int len);
+
 
 /**
  *
@@ -274,11 +314,9 @@ des_key_parity_adjust(uint8_t *key, uint8_t len)
 /**
  *
  */
-static uint8_t *
-des_key_spread(uint8_t *normal)
+static void
+des_key_spread(uint8_t *normal, uint8_t *spread)
 {
-  static uint8_t spread[16];
-
   spread[ 0] = normal[ 0] & 0xfe;
   spread[ 1] = ((normal[ 0] << 7) | (normal[ 1] >> 1)) & 0xfe;
   spread[ 2] = ((normal[ 1] << 6) | (normal[ 2] >> 2)) & 0xfe;
@@ -297,7 +335,6 @@ des_key_spread(uint8_t *normal)
   spread[15] = normal[13] << 1;
 
   des_key_parity_adjust(spread, 16);
-  return spread;
 }
 
 /**
@@ -319,15 +356,14 @@ des_random_get(uint8_t *buffer, uint8_t len)
  *
  */
 static int
-des_encrypt(uint8_t *buffer, int len, uint8_t *deskey)
+des_encrypt(uint8_t *buffer, int len, cwc_t *cwc)
 {
   uint8_t checksum = 0;
   uint8_t noPadBytes;
   uint8_t padBytes[7];
-  char ivec[8];
+  DES_cblock ivec;
   uint16_t i;
 
-  if (!deskey) return len;
   noPadBytes = (8 - ((len - 1) % 8)) % 8;
   if (len + noPadBytes + 1 >= CWS_NETMSGSIZE-8) return -1;
   des_random_get(padBytes, noPadBytes);
@@ -337,9 +373,13 @@ des_encrypt(uint8_t *buffer, int len, uint8_t *deskey)
   des_random_get((uint8_t *)ivec, 8);
   memcpy(buffer+len, ivec, 8);
   for (i = 2; i < len; i += 8) {
-    cbc_crypt((char *)deskey  , (char *) buffer+i, 8, DES_ENCRYPT, ivec);
-    ecb_crypt((char *)deskey+8, (char *) buffer+i, 8, DES_DECRYPT);
-    ecb_crypt((char *)deskey  , (char *) buffer+i, 8, DES_ENCRYPT);
+    DES_ncbc_encrypt(buffer+i, buffer+i, 8,  &cwc->cwc_k1, &ivec, 1);
+
+    DES_ecb_encrypt((DES_cblock *)(buffer+i), (DES_cblock *)(buffer+i),
+		    &cwc->cwc_k2, 0);
+
+    DES_ecb_encrypt((DES_cblock *)(buffer+i), (DES_cblock *)(buffer+i),
+		    &cwc->cwc_k1, 1);
     memcpy(ivec, buffer+i, 8);
   }
   len += 8;
@@ -350,14 +390,13 @@ des_encrypt(uint8_t *buffer, int len, uint8_t *deskey)
  *
  */
 static int 
-des_decrypt(uint8_t *buffer, int len, uint8_t *deskey)
+des_decrypt(uint8_t *buffer, int len, cwc_t *cwc)
 {
-  char ivec[8];
-  char nextIvec[8];
+  DES_cblock ivec;
+  DES_cblock nextIvec;
   int i;
   uint8_t checksum = 0;
 
-  if (!deskey) return len;
   if ((len-2) % 8 || (len-2) < 16) return -1;
   len -= 8;
   memcpy(nextIvec, buffer+len, 8);
@@ -365,9 +404,13 @@ des_decrypt(uint8_t *buffer, int len, uint8_t *deskey)
     {
       memcpy(ivec, nextIvec, 8);
       memcpy(nextIvec, buffer+i, 8);
-      ecb_crypt((char *)deskey  , (char *) buffer+i, 8, DES_DECRYPT);
-      ecb_crypt((char *)deskey+8, (char *) buffer+i, 8, DES_ENCRYPT);
-      cbc_crypt((char *)deskey  , (char *) buffer+i, 8, DES_DECRYPT, ivec);
+
+      DES_ecb_encrypt((DES_cblock *)(buffer+i), (DES_cblock *)(buffer+i),
+		      &cwc->cwc_k1, 0);
+      DES_ecb_encrypt((DES_cblock *)(buffer+i), (DES_cblock *)(buffer+i),
+		      &cwc->cwc_k2, 1);
+
+      DES_ncbc_encrypt(buffer+i, buffer+i, 8,  &cwc->cwc_k1, &ivec, 0);
     } 
   for (i = 2; i < len; i++) checksum ^= buffer[i];
   if (checksum) return -1;
@@ -380,12 +423,15 @@ des_decrypt(uint8_t *buffer, int len, uint8_t *deskey)
 static void
 des_make_login_key(cwc_t *cwc, uint8_t *k)
 {
-  uint8_t des14[14];
+  uint8_t des14[14], spread[16];
   int i;
 
   for (i = 0; i < 14; i++) 
     des14[i] = cwc->cwc_confedkey[i] ^ k[i];
-  memcpy(cwc->cwc_key, des_key_spread(des14), 16);
+  des_key_spread(des14, spread);
+  
+  DES_set_key_unchecked((DES_cblock *)spread,     &cwc->cwc_k1);
+  DES_set_key_unchecked((DES_cblock *)(spread+8), &cwc->cwc_k2);
 }
 
 /**
@@ -394,7 +440,7 @@ des_make_login_key(cwc_t *cwc, uint8_t *k)
 static void
 des_make_session_key(cwc_t *cwc)
 {
-  uint8_t des14[14], *k2 = (uint8_t *)cwc->cwc_password_salted;
+  uint8_t des14[14], spread[16], *k2 = (uint8_t *)cwc->cwc_password_salted;
   int i, l = strlen(cwc->cwc_password_salted);
 
   memcpy(des14, cwc->cwc_confedkey, 14);
@@ -402,7 +448,9 @@ des_make_session_key(cwc_t *cwc)
   for (i = 0; i < l; i++)
     des14[i % 14] ^= k2[i];
 
-  memcpy(cwc->cwc_key, des_key_spread(des14), 16);
+  des_key_spread(des14, spread);
+  DES_set_key_unchecked((DES_cblock *)spread,     &cwc->cwc_k1);
+  DES_set_key_unchecked((DES_cblock *)(spread+8), &cwc->cwc_k2);
 }
 
 /**
@@ -417,8 +465,10 @@ cwc_send_msg(cwc_t *cwc, const uint8_t *msg, size_t len, int sid, int enq)
   uint8_t *buf = cm->cm_data;
   int seq, n;
 
-  if(len + 12 > CWS_NETMSGSIZE)
+  if(len + 12 > CWS_NETMSGSIZE) {
+    free(cm);
     return -1;
+  }
 
   memset(buf, 0, 12);
   memcpy(buf + 12, msg, len);
@@ -432,8 +482,9 @@ cwc_send_msg(cwc_t *cwc, const uint8_t *msg, size_t len, int sid, int enq)
   buf[4] = sid >> 8;
   buf[5] = sid;
 
-  if((len = des_encrypt(buf, len, cwc->cwc_key)) < 0) {
+  if((len = des_encrypt(buf, len, cwc)) <= 0) {
     free(buf);
+    free(cm);
     return -1;
   }
 
@@ -449,6 +500,9 @@ cwc_send_msg(cwc_t *cwc, const uint8_t *msg, size_t len, int sid, int enq)
     pthread_mutex_unlock(&cwc->cwc_writer_mutex);
   } else {
     n = write(cwc->cwc_fd, buf, len);
+    if(n != len)
+      tvhlog(LOG_INFO, "cwc", "write error %s", strerror(errno));
+
     free(cm);
   }
   return seq & 0xffff;
@@ -536,14 +590,14 @@ cwc_decode_card_data_reply(cwc_t *cwc, uint8_t *msg, int len)
   cwc->cwc_connected = 1;
   cwc_comet_status_update(cwc);
   cwc->cwc_caid = (msg[4] << 8) | msg[5];
-  n = psi_caid2name(cwc->cwc_caid) ?: "Unknown";
+  n = psi_caid2name(cwc->cwc_caid & 0xff00) ?: "Unknown";
 
   memcpy(cwc->cwc_ua, &msg[6], 8);
 
-  tvhlog(LOG_INFO, "cwc", "%s: Connected as user 0x%02x "
+  tvhlog(LOG_INFO, "cwc", "%s:%i: Connected as user 0x%02x "
 	 "to a %s-card [0x%04x : %02x.%02x.%02x.%02x.%02x.%02x.%02x.%02x] "
 	 "with %d providers", 
-	 cwc->cwc_hostname,
+	 cwc->cwc_hostname, cwc->cwc_port,
 	 msg[3], n, cwc->cwc_caid, 
 	 cwc->cwc_ua[0], cwc->cwc_ua[1], cwc->cwc_ua[2], cwc->cwc_ua[3], cwc->cwc_ua[4], cwc->cwc_ua[5], cwc->cwc_ua[6], cwc->cwc_ua[7],
 	 nprov);
@@ -566,8 +620,8 @@ cwc_decode_card_data_reply(cwc_t *cwc, uint8_t *msg, int len)
     cwc->cwc_providers[i].sa[6] = msg[9];
     cwc->cwc_providers[i].sa[7] = msg[10];
 
-    tvhlog(LOG_INFO, "cwc", "%s: Provider ID #%d: 0x%06x %02x.%02x.%02x.%02x.%02x.%02x.%02x.%02x",
-	   cwc->cwc_hostname, i + 1,
+    tvhlog(LOG_INFO, "cwc", "%s:%i: Provider ID #%d: 0x%06x %02x.%02x.%02x.%02x.%02x.%02x.%02x.%02x",
+	   cwc->cwc_hostname, cwc->cwc_port, i + 1,
 	   cwc->cwc_providers[i].id,
 	   cwc->cwc_providers[i].sa[0],
 	   cwc->cwc_providers[i].sa[1],
@@ -590,16 +644,16 @@ cwc_decode_card_data_reply(cwc_t *cwc, uint8_t *msg, int len)
 
     if (!emm_allowed) {
       tvhlog(LOG_INFO, "cwc", 
-	     "%s: Will not forward EMMs (not allowed by server)",
-	     cwc->cwc_hostname);
+	     "%s:%i: Will not forward EMMs (not allowed by server)",
+	     cwc->cwc_hostname, cwc->cwc_port);
     } else if (cwc->cwc_card_type != CARD_UNKNOWN) {
-      tvhlog(LOG_INFO, "cwc", "%s: Will forward EMMs",
-	     cwc->cwc_hostname);
+      tvhlog(LOG_INFO, "cwc", "%s:%i: Will forward EMMs",
+	     cwc->cwc_hostname, cwc->cwc_port);
       cwc->cwc_forward_emm = 1;
     } else {
       tvhlog(LOG_INFO, "cwc", 
-	     "%s: Will not forward EMMs (unsupported CA system)",
-	     cwc->cwc_hostname);
+	     "%s:%i: Will not forward EMMs (unsupported CA system)",
+	     cwc->cwc_hostname, cwc->cwc_port);
     }
   }
 
@@ -617,23 +671,57 @@ static void
 cwc_detect_card_type(cwc_t *cwc)
 {
   uint8_t c_sys = cwc->cwc_caid >> 8;
+
+  switch(cwc->cwc_caid) {
+  case 0x5581:
+  case 0x4aee:
+    cwc->cwc_card_type = CARD_BULCRYPT;
+    tvhlog(LOG_INFO, "cwc", "%s:%i: bulcrypt card",
+	   cwc->cwc_hostname, cwc->cwc_port);
+    return;
+  }
 		
   switch(c_sys) {
   case 0x17:
   case 0x06: 
     cwc->cwc_card_type = CARD_IRDETO;
-    tvhlog(LOG_INFO, "cwc", "%s: irdeto card",
-	   cwc->cwc_hostname);
+    tvhlog(LOG_INFO, "cwc", "%s:%i: irdeto card",
+	   cwc->cwc_hostname, cwc->cwc_port);
+    break;
+  case 0x05:
+    cwc->cwc_card_type = CARD_VIACCESS;
+    tvhlog(LOG_INFO, "cwc", "%s:%i: viaccess card",
+	   cwc->cwc_hostname, cwc->cwc_port);
     break;
   case 0x0b:
     cwc->cwc_card_type = CARD_CONAX;
-    tvhlog(LOG_INFO, "cwc", "%s: conax card",
-	   cwc->cwc_hostname);
+    tvhlog(LOG_INFO, "cwc", "%s:%i: conax card",
+	   cwc->cwc_hostname, cwc->cwc_port);
     break;
   case 0x01:
     cwc->cwc_card_type = CARD_SECA;
-    tvhlog(LOG_INFO, "cwc", "%s: seca card",
-	   cwc->cwc_hostname);
+    tvhlog(LOG_INFO, "cwc", "%s:%i: seca card",
+	   cwc->cwc_hostname, cwc->cwc_port);
+    break;
+  case 0x4a:
+    cwc->cwc_card_type = CARD_DRE;
+    tvhlog(LOG_INFO, "cwc", "%s:%i: dre card",
+	   cwc->cwc_hostname, cwc->cwc_port);
+    break;
+  case 0x18:
+    cwc->cwc_card_type = CARD_NAGRA;
+    tvhlog(LOG_INFO, "cwc", "%s:%i: nagra card",
+	   cwc->cwc_hostname, cwc->cwc_port);
+    break;
+  case 0x09:
+    cwc->cwc_card_type = CARD_NDS;
+    tvhlog(LOG_INFO, "cwc", "%s:%i: nds card",
+	   cwc->cwc_hostname, cwc->cwc_port);
+    break;
+  case 0x0d:
+    cwc->cwc_card_type = CARD_CRYPTOWORKS;
+    tvhlog(LOG_INFO, "cwc", "%s:%i: cryptoworks card",
+	   cwc->cwc_hostname, cwc->cwc_port);
     break;
   default:
     cwc->cwc_card_type = CARD_UNKNOWN;
@@ -657,16 +745,18 @@ cwc_send_login(cwc_t *cwc)
   memcpy(buf + 3,      cwc->cwc_username, ul);
   memcpy(buf + 3 + ul, cwc->cwc_password_salted, pl);
  
-  cwc_send_msg(cwc, buf, ul + pl + 3, 0, 0);
+  cwc_send_msg(cwc, buf, ul + pl + 3, TVHEADEND_PROTOCOL_ID, 0);
 }
 
 
 
 static void
-handle_ecm_reply(cwc_transport_t *ct, ecm_section_t *es, uint8_t *msg,
+handle_ecm_reply(cwc_service_t *ct, ecm_section_t *es, uint8_t *msg,
 		 int len, int seq)
 {
-  th_transport_t *t = ct->ct_transport;
+  service_t *t = ct->cs_service;
+  cwc_service_t *ct2;
+  cwc_t *cwc2;
   ecm_pid_t *ep;
   char chaninfo[32];
   int i;
@@ -684,70 +774,110 @@ handle_ecm_reply(cwc_transport_t *ct, ecm_section_t *es, uint8_t *msg,
     
     /* ERROR */
 
-    if(ct->ct_okchannel == es->es_channel)
-      ct->ct_okchannel = -1;
+    if(ct->cs_okchannel == es->es_channel)
+      ct->cs_okchannel = -1;
 
-    if(ct->ct_keystate == CT_FORBIDDEN)
+    if (es->es_nok < 3)
+      es->es_nok++;
+
+    if(ct->cs_keystate == CS_FORBIDDEN)
       return; // We already know it's bad
 
-    es->es_nok = 1;
+    if (es->es_nok > 2) {
+      tvhlog(LOG_DEBUG, "cwc",
+             "Too many NOKs for service \"%s\"%s from %s:%i",
+             t->s_svcname, chaninfo, ct->cs_cwc->cwc_hostname,
+             ct->cs_cwc->cwc_port);
+      goto forbid;
+    }
+
+    TAILQ_FOREACH(cwc2, &cwcs, cwc_link) {
+      LIST_FOREACH(ct2, &cwc2->cwc_services, cs_link) {
+        if (ct != ct2 && ct2->cs_service == t &&
+            ct2->cs_keystate == CS_RESOLVED) {
+          tvhlog(LOG_DEBUG, "cwc",
+	    "NOK from %s:%i: Already has a key for service \"%s\", from %s:%i",
+            ct->cs_cwc->cwc_hostname, ct->cs_cwc->cwc_port,
+	    t->s_svcname, ct2->cs_cwc->cwc_hostname, ct2->cs_cwc->cwc_port);
+          es->es_nok = 3; /* do not send more ECM requests */
+          goto forbid;
+        }
+      }
+    }
 
     tvhlog(LOG_DEBUG, "cwc", "Received NOK for service \"%s\"%s (seqno: %d "
-	   "Req delay: %lld ms)", t->tht_svcname, chaninfo, seq, delay);
+	   "Req delay: %"PRId64" ms)", t->s_svcname, chaninfo, seq, delay);
 
-    LIST_FOREACH(ep, &ct->ct_pids, ep_link) {
+forbid:
+    LIST_FOREACH(ep, &ct->cs_pids, ep_link) {
       for(i = 0; i <= ep->ep_last_section; i++)
-	if(ep->ep_sections[i] == NULL || 
-	   ep->ep_sections[i]->es_pending ||
-	   ep->ep_sections[i]->es_nok == 0)
-	  return;
+	if(ep->ep_sections[i] == NULL) {
+          if(es->es_nok < 2) /* only first hit is allowed */
+            return;
+	} else {
+          if(ep->ep_sections[i]->es_pending ||
+	     ep->ep_sections[i]->es_nok == 0)
+	    return;
+        }
     }
     tvhlog(LOG_ERR, "cwc",
 	   "Can not descramble service \"%s\", access denied (seqno: %d "
-	   "Req delay: %lld ms)",
-	   t->tht_svcname, seq, delay);
-    ct->ct_keystate = CT_FORBIDDEN;
+	   "Req delay: %"PRId64" ms)",
+	   t->s_svcname, seq, delay);
+    ct->cs_keystate = CS_FORBIDDEN;
     return;
 
   } else {
 
-    ct->ct_okchannel = es->es_channel;
+    ct->cs_okchannel = es->es_channel;
     es->es_nok = 0;
 
     tvhlog(LOG_DEBUG, "cwc",
 	   "Received ECM reply%s for service \"%s\" "
 	   "even: %02x.%02x.%02x.%02x.%02x.%02x.%02x.%02x"
 	   " odd: %02x.%02x.%02x.%02x.%02x.%02x.%02x.%02x (seqno: %d "
-	   "Req delay: %lld ms)",
+	   "Req delay: %"PRId64" ms)",
 	   chaninfo,
-	   t->tht_svcname,
+	   t->s_svcname,
 	   msg[3 + 0], msg[3 + 1], msg[3 + 2], msg[3 + 3], msg[3 + 4],
 	   msg[3 + 5], msg[3 + 6], msg[3 + 7], msg[3 + 8], msg[3 + 9],
 	   msg[3 + 10],msg[3 + 11],msg[3 + 12],msg[3 + 13],msg[3 + 14],
 	   msg[3 + 15], seq, delay);
+
+    TAILQ_FOREACH(cwc2, &cwcs, cwc_link) {
+      LIST_FOREACH(ct2, &cwc2->cwc_services, cs_link) {
+        if (ct != ct2 && ct2->cs_service == t &&
+            ct2->cs_keystate == CS_RESOLVED) {
+          ct->cs_keystate = CS_IDLE;
+          tvhlog(LOG_DEBUG, "cwc",
+	     "Already has a key for service \"%s\", from %s:%i",
+	     t->s_svcname, ct2->cs_cwc->cwc_hostname, ct2->cs_cwc->cwc_port);
+          return;
+        }
+      }
+    }
     
-    if(ct->ct_keystate != CT_RESOLVED)
+    if(ct->cs_keystate != CS_RESOLVED)
       tvhlog(LOG_INFO, "cwc",
-	     "Obtained key for for service \"%s\" in %lld ms, from %s",
-	     t->tht_svcname, delay, ct->ct_cwc->cwc_hostname);
-    
-    pthread_mutex_lock(&t->tht_stream_mutex);
-    ct->ct_keystate = CT_RESOLVED;
-    memcpy(ct->ct_cw, msg + 3, 16);
-    ct->ct_pending_cw_update = 1;
-    pthread_mutex_unlock(&t->tht_stream_mutex);
+	     "Obtained key for service \"%s\" in %"PRId64" ms, from %s:%i",
+	     t->s_svcname, delay, ct->cs_cwc->cwc_hostname,
+	     ct->cs_cwc->cwc_port);
+
+    ct->cs_keystate = CS_RESOLVED;
+    memcpy(ct->cs_cw, msg + 3, 16);
+    ct->cs_pending_cw_update = 1;
   }
 }
 
 
 /**
  * Handle running reply
- * global_lock is held
+ * cwc_mutex is held
  */
 static int
 cwc_running_reply(cwc_t *cwc, uint8_t msgtype, uint8_t *msg, int len)
 {
-  cwc_transport_t *ct;
+  cwc_service_t *ct;
   ecm_pid_t *ep;
   ecm_section_t *es;
   uint16_t seq = (msg[2] << 8) | msg[3];
@@ -759,8 +889,8 @@ cwc_running_reply(cwc_t *cwc, uint8_t msgtype, uint8_t *msg, int len)
   switch(msgtype) {
   case 0x80:
   case 0x81:
-    LIST_FOREACH(ct, &cwc->cwc_transports, ct_link) {
-      LIST_FOREACH(ep, &ct->ct_pids, ep_link) {
+    LIST_FOREACH(ct, &cwc->cwc_services, cs_link) {
+      LIST_FOREACH(ep, &ct->cs_pids, ep_link) {
 	for(i = 0; i <= ep->ep_last_section; i++) {
 	  es = ep->ep_sections[i];
 	  if(es != NULL) {
@@ -797,9 +927,9 @@ cwc_read(cwc_t *cwc, void *buf, size_t len, int timeout)
 {
   int r;
 
-  pthread_mutex_unlock(&global_lock);
+  pthread_mutex_unlock(&cwc_mutex);
   r = tcp_read_timeout(cwc->cwc_fd, buf, len, timeout);
-  pthread_mutex_lock(&global_lock);
+  pthread_mutex_lock(&cwc_mutex);
 
   if(cwc_must_break(cwc))
     return ECONNABORTED;
@@ -818,15 +948,15 @@ cwc_read_message(cwc_t *cwc, const char *state, int timeout)
   int msglen, r;
 
   if((r = cwc_read(cwc, buf, 2, timeout))) {
-    tvhlog(LOG_INFO, "cwc", "%s: %s: Read error (header): %s",
-	   cwc->cwc_hostname, state, strerror(r));
+    tvhlog(LOG_INFO, "cwc", "%s:%i: %s: Read error (header): %s",
+	   cwc->cwc_hostname, cwc->cwc_port, state, strerror(r));
     return -1;
   }
 
   msglen = (buf[0] << 8) | buf[1];
   if(msglen >= CWS_NETMSGSIZE) {
-    tvhlog(LOG_INFO, "cwc", "%s: %s: Invalid message size: %d",
-	   cwc->cwc_hostname, state, msglen);
+    tvhlog(LOG_INFO, "cwc", "%s:%i: %s: Invalid message size: %d",
+	   cwc->cwc_hostname, cwc->cwc_port, state, msglen);
     return -1;
   }
 
@@ -834,14 +964,14 @@ cwc_read_message(cwc_t *cwc, const char *state, int timeout)
      so just wait 1 second here */
 
   if((r = cwc_read(cwc, cwc->cwc_buf + 2, msglen, 1000))) {
-    tvhlog(LOG_INFO, "cwc", "%s: %s: Read error: %s",
-	   cwc->cwc_hostname, state, strerror(r));
+    tvhlog(LOG_INFO, "cwc", "%s:%i: %s: Read error: %s",
+	   cwc->cwc_hostname, cwc->cwc_port, state, strerror(r));
     return -1;
   }
 
-  if((msglen = des_decrypt(cwc->cwc_buf, msglen + 2, cwc->cwc_key)) < 15) {
-    tvhlog(LOG_INFO, "cwc", "%s: %s: Decrypt failed",
-	   state, cwc->cwc_hostname);
+  if((msglen = des_decrypt(cwc->cwc_buf, msglen + 2, cwc)) < 15) {
+    tvhlog(LOG_INFO, "cwc", "%s:%i: %s: Decrypt failed",
+	   cwc->cwc_hostname, cwc->cwc_port, state);
     return -1;
   }
   return msglen;
@@ -903,8 +1033,8 @@ cwc_session(cwc_t *cwc)
    * Get login key
    */
   if((r = cwc_read(cwc, cwc->cwc_buf, 14, 5000))) {
-    tvhlog(LOG_INFO, "cwc", "%s: No login key received: %s",
-	   cwc->cwc_hostname, strerror(r));
+    tvhlog(LOG_INFO, "cwc", "%s:%i: No login key received: %s",
+	   cwc->cwc_hostname, cwc->cwc_port, strerror(r));
     return;
   }
 
@@ -919,7 +1049,8 @@ cwc_session(cwc_t *cwc)
     return;
 
   if(cwc->cwc_buf[12] != MSG_CLIENT_2_SERVER_LOGIN_ACK) {
-    tvhlog(LOG_INFO, "cwc", "%s: Login failed", cwc->cwc_hostname);
+    tvhlog(LOG_INFO, "cwc", "%s:%i: Login failed",
+           cwc->cwc_hostname, cwc->cwc_port);
     return;
   }
 
@@ -933,7 +1064,8 @@ cwc_session(cwc_t *cwc)
     return;
 
   if(cwc->cwc_buf[12] != MSG_CARD_DATA) {
-    tvhlog(LOG_INFO, "cwc", "%s: Card data request failed", cwc->cwc_hostname);
+    tvhlog(LOG_INFO, "cwc", "%s:%i: Card data request failed",
+           cwc->cwc_hostname, cwc->cwc_port);
     return;
   }
 
@@ -982,33 +1114,33 @@ cwc_session(cwc_t *cwc)
 static void *
 cwc_thread(void *aux)
 {
-  cwc_transport_t *ct;
+  cwc_service_t *ct;
   cwc_t *cwc = aux;
   int fd, d;
   char errbuf[100];
-  th_transport_t *t;
+  service_t *t;
   char hostname[256];
   int port;
   struct timespec ts;
   int attempts = 0;
 
-  pthread_mutex_lock(&global_lock);
+  pthread_mutex_lock(&cwc_mutex);
 
   while(cwc->cwc_running) {
     
     while(cwc->cwc_running && cwc->cwc_enabled == 0)
-      pthread_cond_wait(&cwc->cwc_cond, &global_lock);
+      pthread_cond_wait(&cwc->cwc_cond, &cwc_mutex);
 
     snprintf(hostname, sizeof(hostname), "%s", cwc->cwc_hostname);
     port = cwc->cwc_port;
 
     tvhlog(LOG_INFO, "cwc", "Attemping to connect to %s:%d", hostname, port);
 
-    pthread_mutex_unlock(&global_lock);
+    pthread_mutex_unlock(&cwc_mutex);
 
     fd = tcp_connect(hostname, port, errbuf, sizeof(errbuf), 10);
 
-    pthread_mutex_lock(&global_lock);
+    pthread_mutex_lock(&cwc_mutex);
 
     if(fd == -1) {
       attempts++;
@@ -1035,34 +1167,31 @@ cwc_thread(void *aux)
       cwc->cwc_caid = 0;
       cwc->cwc_connected = 0;
       cwc_comet_status_update(cwc);
-      tvhlog(LOG_INFO, "cwc", "Disconnected from %s",  cwc->cwc_hostname);
+      tvhlog(LOG_INFO, "cwc", "Disconnected from %s:%i", 
+             cwc->cwc_hostname, cwc->cwc_port);
     }
 
-    if(subscriptions_active()) {
-      if(attempts == 1)
-	continue; // Retry immediately
-      d = 3;
-    } else {
-      d = 60;
-    }
+    if(attempts == 1) continue; // Retry immediately
+    d = 3;
 
     ts.tv_sec = time(NULL) + d;
     ts.tv_nsec = 0;
 
     tvhlog(LOG_INFO, "cwc", 
-	   "%s: Automatic connection attempt in in %d seconds",
-	   cwc->cwc_hostname, d);
+	   "%s:%i: Automatic connection attempt in in %d seconds",
+	   cwc->cwc_hostname, cwc->cwc_port, d);
 
-    pthread_cond_timedwait(&cwc_config_changed, &global_lock, &ts);
+    pthread_cond_timedwait(&cwc_config_changed, &cwc_mutex, &ts);
   }
 
-  tvhlog(LOG_INFO, "cwc", "%s destroyed", cwc->cwc_hostname);
+  tvhlog(LOG_INFO, "cwc", "%s:%i destroyed",
+         cwc->cwc_hostname, cwc->cwc_port);
 
-  while((ct = LIST_FIRST(&cwc->cwc_transports)) != NULL) {
-    t = ct->ct_transport;
-    pthread_mutex_lock(&t->tht_stream_mutex);
-    cwc_transport_destroy(&ct->ct_head);
-    pthread_mutex_unlock(&t->tht_stream_mutex);
+  while((ct = LIST_FIRST(&cwc->cwc_services)) != NULL) {
+    t = ct->cs_service;
+    pthread_mutex_lock(&t->s_stream_mutex);
+    cwc_service_destroy(&ct->cs_head);
+    pthread_mutex_unlock(&t->s_stream_mutex);
   }
 
   free((void *)cwc->cwc_password);
@@ -1071,7 +1200,7 @@ cwc_thread(void *aux)
   free((void *)cwc->cwc_hostname);
   free(cwc);
 
-  pthread_mutex_unlock(&global_lock);
+  pthread_mutex_unlock(&cwc_mutex);
   return NULL;
 }
 
@@ -1093,19 +1222,52 @@ verify_provider(cwc_t *cwc, uint32_t providerid)
   return 0;
 }
 
+/**
+ *
+ */
+static void
+cwc_emm_cache_insert(cwc_t *cwc, uint32_t crc)
+{
+  /* evict the oldest entry */
+  cwc->cwc_emm_cache.cache[cwc->cwc_emm_cache.w] = crc;
+  cwc->cwc_emm_cache.w = (cwc->cwc_emm_cache.w+1)&EMM_CACHE_MASK;
+  if (cwc->cwc_emm_cache.n < EMM_CACHE_SIZE)
+    cwc->cwc_emm_cache.n++;
+}
+
+static int
+cwc_emm_cache_lookup(cwc_t *cwc, uint32_t crc)
+{
+  int i;
+  for (i=0; i<cwc->cwc_emm_cache.n; i++)
+    if (cwc->cwc_emm_cache.cache[i] == crc)
+      return 1;
+  return 0;
+}
+
 
 /**
  *
  */
 void
-cwc_emm(uint8_t *data, int len)
+cwc_emm(uint8_t *data, int len, uint16_t caid, void *ca_update_id)
 {
   cwc_t *cwc;
 
-  lock_assert(&global_lock);
+  pthread_mutex_lock(&cwc_mutex);
 
   TAILQ_FOREACH(cwc, &cwcs, cwc_link) {
-    if(cwc->cwc_forward_emm && cwc->cwc_writer_running) {
+    if(cwc->cwc_caid == caid &&
+       cwc->cwc_forward_emm && cwc->cwc_writer_running) {
+      if (cwc->cwc_emmex) {
+        if (cwc->cwc_update_id != ca_update_id) {
+          int64_t delta = getmonoclock() - cwc->cwc_update_time;
+          if (delta < 25000000UL)		/* 25 seconds */
+            continue;
+        }
+        cwc->cwc_update_time = getmonoclock();
+      }
+      cwc->cwc_update_id = ca_update_id;
       switch (cwc->cwc_card_type) {
       case CARD_CONAX:
 	cwc_emm_conax(cwc, data, len);
@@ -1116,11 +1278,30 @@ cwc_emm(uint8_t *data, int len)
       case CARD_SECA:
 	cwc_emm_seca(cwc, data, len);
 	break;
+      case CARD_VIACCESS:
+	cwc_emm_viaccess(cwc, data, len);
+	break;
+      case CARD_DRE:
+	cwc_emm_dre(cwc, data, len);
+	break;
+      case CARD_NAGRA:
+	cwc_emm_nagra(cwc, data, len);
+	break;
+      case CARD_NDS:
+	cwc_emm_nds(cwc, data, len);
+	break;
+      case CARD_CRYPTOWORKS:
+	cwc_emm_cryptoworks(cwc, data, len);
+	break;
+      case CARD_BULCRYPT:
+	cwc_emm_bulcrypt(cwc, data, len);
+	break;
       case CARD_UNKNOWN:
 	break;
       }
     }
   }
+  pthread_mutex_unlock(&cwc_mutex);
 }
 
 
@@ -1204,17 +1385,192 @@ cwc_emm_seca(cwc_t *cwc, uint8_t *data, int len)
     cwc_send_msg(cwc, data, len, 0, 1);
 }
 
+/**
+ * viaccess emm handler
+ * inspired by opensasc-ng, https://opensvn.csie.org/traccgi/opensascng/
+ */
+static
+uint8_t * nano_start(uint8_t * data)
+{
+  switch(data[0]) {
+  case 0x88: return &data[8];
+  case 0x8e: return &data[7];
+  case 0x8c:
+  case 0x8d: return &data[3];
+  case 0x80:
+  case 0x81: return &data[4];
+  }
+  return NULL;
+}
+
+static
+uint8_t * nano_checknano90fromnano(uint8_t * data)
+{
+  if(data && data[0]==0x90 && data[1]==0x03) return data;
+  return 0;
+}
+
+static
+uint8_t * nano_checknano90(uint8_t * data)
+{
+  return nano_checknano90fromnano(nano_start(data));
+}
+
+static
+int sort_nanos(uint8_t *dest, const uint8_t *src, int len)
+{
+  int w = 0, c = -1;
+
+  while (1) {
+    int j, n;
+    n = 0x100;
+    for (j = 0; j < len;) {
+      int l = src[j + 1] + 2;
+      if (src[j] == c) {
+	if (w + l > len) {
+	  return -1;
+	}
+	memcpy(dest + w, src + j, l);
+	w += l;
+      }
+      else if (src[j] > c && src[j] < n) {
+	n = src[j];
+      }
+      j += l;
+    }
+    if (n == 0x100) {
+      break;
+    }
+    c = n;
+  }
+  return 0;
+}
+
+static int via_provider_id(uint8_t * data)
+{
+  const uint8_t * tmp;
+  tmp = nano_checknano90(data);
+  if (!tmp) return 0;
+  return (tmp[2] << 16) | (tmp[3] << 8) | (tmp[4]&0xf0);
+}
+
+
+void
+cwc_emm_viaccess(cwc_t *cwc, uint8_t *data, int mlen)
+{
+  /* Get SCT len */
+  int len = 3 + ((data[1] & 0x0f) << 8) + data[2];
+
+  switch (data[0])
+    {
+    case 0x8c:
+    case 0x8d:
+      {
+	int match = 0;
+	int i;
+	uint32_t id;
+
+	/* Match provider id */
+	id = via_provider_id(data);
+	if (!id) break;
+
+	for(i = 0; i < cwc->cwc_num_providers; i++)
+	  if(cwc->cwc_providers[i].id == id) {
+	    match = 1;
+	    break;
+	  }
+	if (!match) break;
+
+	if (data[0] != cwc->cwc_viaccess_emm.shared_toggle) {
+	  cwc->cwc_viaccess_emm.shared_len = 0;
+	  free(cwc->cwc_viaccess_emm.shared_emm);
+	  cwc->cwc_viaccess_emm.shared_emm = (uint8_t*)malloc(len);
+	  if (cwc->cwc_viaccess_emm.shared_emm) {
+	    cwc->cwc_viaccess_emm.shared_len = len;
+	    memcpy(cwc->cwc_viaccess_emm.shared_emm, data, len);
+	    cwc->cwc_viaccess_emm.ca_update_id = cwc->cwc_update_id;
+	  }
+	  cwc->cwc_viaccess_emm.shared_toggle = data[0];
+	}
+      }
+      break;
+    case 0x8e:
+      if (cwc->cwc_viaccess_emm.shared_emm &&
+          cwc->cwc_viaccess_emm.ca_update_id == cwc->cwc_update_id) {
+	int match = 0;
+	int i;
+	/* Match SA and provider in shared */
+	for(i = 0; i < cwc->cwc_num_providers; i++) {
+	  if(memcmp(&data[3],&cwc->cwc_providers[i].sa[4], 3)) continue;
+	  if((data[6]&2)) continue;
+	  if(via_provider_id(cwc->cwc_viaccess_emm.shared_emm) != cwc->cwc_providers[i].id) continue;
+	  match = 1;
+	  break;
+	}
+	if (!match) break;
+
+	uint8_t * tmp = alloca(len + cwc->cwc_viaccess_emm.shared_len);
+	uint8_t * ass = nano_start(data);
+	len -= (ass - data);
+	if((data[6] & 2) == 0)  {
+	  int addrlen = len - 8;
+	  len=0;
+	  tmp[len++] = 0x9e;
+	  tmp[len++] = addrlen;
+	  memcpy(&tmp[len], &ass[0], addrlen); len += addrlen;
+	  tmp[len++] = 0xf0;
+	  tmp[len++] = 0x08;
+	  memcpy(&tmp[len],&ass[addrlen],8); len += 8;
+	} else {
+	  memcpy(tmp, ass, len);
+	}
+	ass = nano_start(cwc->cwc_viaccess_emm.shared_emm);
+	int l = cwc->cwc_viaccess_emm.shared_len - (ass - cwc->cwc_viaccess_emm.shared_emm);
+	memcpy(&tmp[len], ass, l); len += l;
+
+	ass = (uint8_t*) alloca(len+7);
+	if(ass) {
+	  uint32_t crc;
+
+	  memcpy(ass, data, 7);
+	  if (sort_nanos(ass + 7, tmp, len)) {
+	    return;
+	  }
+
+	  /* Set SCT len */
+	  len += 4;
+	  ass[1] = (len>>8) | 0x70;
+	  ass[2] = len & 0xff;
+	  len += 3;
+
+	  crc = tvh_crc32(ass, len, 0xffffffff);
+	  if (!cwc_emm_cache_lookup(cwc, crc)) {
+	    tvhlog(LOG_DEBUG, "cwc",
+		   "Send EMM "
+		   "%02x.%02x.%02x.%02x.%02x.%02x.%02x.%02x"
+		   "...%02x.%02x.%02x.%02x",
+		   ass[0], ass[1], ass[2], ass[3],
+		   ass[4], ass[5], ass[6], ass[7],
+		   ass[len-4], ass[len-3], ass[len-2], ass[len-1]);
+	    cwc_send_msg(cwc, ass, len, 0, 1);
+	    cwc_emm_cache_insert(cwc, crc);
+	  }
+	}
+      }
+      break;
+    }
+}
 
 /**
- *
+ * t->s_streaming_mutex is held
  */
 static void
-cwc_table_input(struct th_descrambler *td, struct th_transport *t,
-		struct th_stream *st, const uint8_t *data, int len)
+cwc_table_input(struct th_descrambler *td, struct service *t,
+		struct elementary_stream *st, const uint8_t *data, int len)
 {
-  cwc_transport_t *ct = (cwc_transport_t *)td;
-  uint16_t sid = t->tht_dvb_service_id;
-  cwc_t *cwc = ct->ct_cwc;
+  cwc_service_t *ct = (cwc_service_t *)td;
+  uint16_t sid = t->s_dvb_service_id;
+  cwc_t *cwc = ct->cs_cwc;
   int channel;
   int section;
   ecm_pid_t *ep;
@@ -1222,25 +1578,28 @@ cwc_table_input(struct th_descrambler *td, struct th_transport *t,
   char chaninfo[32];
   caid_t *c;
 
+  if (ct->cs_keystate == CS_IDLE)
+    return;
+
   if(len > 4096)
     return;
 
   if((data[0] & 0xf0) != 0x80)
     return;
 
-  LIST_FOREACH(ep, &ct->ct_pids, ep_link) {
-    if(ep->ep_pid == st->st_pid)
+  LIST_FOREACH(ep, &ct->cs_pids, ep_link) {
+    if(ep->ep_pid == st->es_pid)
       break;
   }
 
   if(ep == NULL) {
     ep = calloc(1, sizeof(ecm_pid_t));
-    ep->ep_pid = st->st_pid;
-    LIST_INSERT_HEAD(&ct->ct_pids, ep, ep_link);
+    ep->ep_pid = st->es_pid;
+    LIST_INSERT_HEAD(&ct->cs_pids, ep, ep_link);
   }
 
 
-  LIST_FOREACH(c, &st->st_caids, link) {
+  LIST_FOREACH(c, &st->es_caids, link) {
     if(cwc->cwc_caid == c->caid)
       break;
   }
@@ -1273,12 +1632,15 @@ cwc_table_input(struct th_descrambler *td, struct th_transport *t,
 
     es = ep->ep_sections[section];
 
+    if (es->es_nok > 2)
+      break; /* too many NOK responses in a row */
+
     if(es->es_ecmsize == len && !memcmp(es->es_ecm, data, len))
       break; /* key already sent */
 
     if(cwc->cwc_fd == -1) {
       // New key, but we are not connected (anymore), can not descramble
-      ct->ct_keystate = CT_UNKNOWN;
+      ct->cs_keystate = CS_UNKNOWN;
       break;
     }
 
@@ -1289,8 +1651,8 @@ cwc_table_input(struct th_descrambler *td, struct th_transport *t,
     memcpy(es->es_ecm, data, len);
     es->es_ecmsize = len;
 
-    if(ct->ct_okchannel != -1 && channel != -1 && 
-       ct->ct_okchannel != channel) {
+    if(ct->cs_okchannel != -1 && channel != -1 && 
+       ct->cs_okchannel != channel) {
       tvhlog(LOG_DEBUG, "cwc", "Filtering ECM channel %d", channel);
       return;
     }
@@ -1299,8 +1661,8 @@ cwc_table_input(struct th_descrambler *td, struct th_transport *t,
 
     tvhlog(LOG_DEBUG, "cwc", 
 	   "Sending ECM%s section=%d/%d, for service %s (seqno: %d) PID %d", 
-	   chaninfo, section, ep->ep_last_section, t->tht_svcname, es->es_seq,
-	   st->st_pid);
+	   chaninfo, section, ep->ep_last_section, t->s_svcname, es->es_seq,
+	   st->es_pid);
     es->es_time = getmonoclock();
     break;
 
@@ -1312,24 +1674,181 @@ cwc_table_input(struct th_descrambler *td, struct th_transport *t,
   }
 }
 
+/**
+ * dre emm handler
+ */
+void
+cwc_emm_dre(cwc_t *cwc, uint8_t *data, int len)
+{
+  int match = 0;
+
+  if (data[0] == 0x87) {
+    if (memcmp(&data[3], &cwc->cwc_ua[4], 4) == 0) {
+      match = 1;
+    }
+  } 
+  else if (data[0] == 0x86) {
+    int i;
+    for (i=0; i < cwc->cwc_num_providers; i++) {
+      if (memcmp(&data[40], &cwc->cwc_providers[i].sa[4], 4) == 0) {
+/*      if (memcmp(&data[3], &cwc->cwc_providers[i].sa[4], 1) == 0) { */
+        match = 1;
+        break;
+      }
+    }
+  }
+
+  if (match)
+    cwc_send_msg(cwc, data, len, 0, 1);
+}
+
+void
+cwc_emm_nagra(cwc_t *cwc, uint8_t *data, int len)
+{
+  int match = 0;
+  unsigned char hexserial[4];
+
+  if (data[0] == 0x83) {      // unique|shared
+    hexserial[0] = data[5];
+    hexserial[1] = data[4];
+    hexserial[2] = data[3];
+    hexserial[3] = data[6];
+    if (memcmp(hexserial, &cwc->cwc_ua[4], (data[7] == 0x10) ? 3 : 4) == 0)
+      match = 1;
+  } 
+  else if (data[0] == 0x82) { // global
+    match = 1;
+  }
+
+  if (match)
+    cwc_send_msg(cwc, data, len, 0, 1);
+}
+
+void
+cwc_emm_nds(cwc_t *cwc, uint8_t *data, int len)
+{
+  int match = 0;
+  int i;
+  int serial_count = ((data[3] >> 4) & 3) + 1;
+  unsigned char emmtype = (data[3] & 0xC0) >> 6;
+
+  if (emmtype == 1 || emmtype == 2) {  // unique|shared
+    for (i = 0; i < serial_count; i++) {
+      if (memcmp(&data[i * 4 + 4], &cwc->cwc_ua[4], 5 - emmtype) == 0) {
+        match = 1;
+        break;
+      }
+    }
+  }
+  else if (emmtype == 0) {  // global
+    match = 1;
+  }
+
+  if (match)
+    cwc_send_msg(cwc, data, len, 0, 1);
+}
+
+void
+cwc_emm_cryptoworks(cwc_t *cwc, uint8_t *data, int len)
+{
+  int match = 0;
+
+  switch (data[0]) {
+  case 0x82: /* unique */
+    match = len >= 10 && memcmp(data + 5, cwc->cwc_ua + 3, 5) == 0;
+    break;
+  case 0x84: /* emm-sh */
+    if (len >= 9 && memcmp(data + 5, cwc->cwc_ua + 3, 4) == 0) {
+      if (cwc->cwc_cryptoworks_emm.shared_emm) {
+        free(cwc->cwc_cryptoworks_emm.shared_emm);
+        cwc->cwc_cryptoworks_emm.shared_len = 0;
+        cwc->cwc_cryptoworks_emm.shared_emm = (uint8_t *)malloc(len);
+      }
+      cwc->cwc_cryptoworks_emm.shared_emm = malloc(len);
+      if (cwc->cwc_cryptoworks_emm.shared_emm) {
+        cwc->cwc_cryptoworks_emm.shared_len = len;
+        memcpy(cwc->cwc_cryptoworks_emm.shared_emm, data, len);
+        cwc->cwc_cryptoworks_emm.ca_update_id = cwc->cwc_update_id;
+      }
+    }
+    break;
+  case 0x86: /* emm-sb */ 
+    if (cwc->cwc_cryptoworks_emm.shared_emm &&
+        cwc->cwc_cryptoworks_emm.ca_update_id == cwc->cwc_update_id) {
+      /* python: EMM_SH[0:12] + EMM_SB[5:-1] + EMM_SH[12:-1] */
+      uint32_t elen = len - 5 + cwc->cwc_cryptoworks_emm.shared_len - 12;
+      uint8_t *tmp = malloc(elen);
+      uint8_t *composed = tmp ? malloc(elen + 12) : NULL;
+      if (composed) {
+        memcpy(tmp, data + 5, len - 5);
+        memcpy(tmp + len - 5, cwc->cwc_cryptoworks_emm.shared_emm + 12,
+                                cwc->cwc_cryptoworks_emm.shared_len - 12);
+        memcpy(composed, cwc->cwc_cryptoworks_emm.shared_emm, 12);
+        sort_nanos(composed + 12, tmp, elen);
+        composed[1] = ((elen + 9) >> 8) | 0x70;
+        composed[2] = (elen + 9) & 0xff;
+        cwc_send_msg(cwc, composed, elen + 12, 0, 1);
+        free(composed);
+        free(tmp);
+      }
+      cwc->cwc_cryptoworks_emm.shared_emm = NULL;
+      cwc->cwc_cryptoworks_emm.shared_len = 0;
+    }
+    break;
+  case 0x88: /* global */
+  case 0x89: /* global */
+    match = 1;
+    break;
+  default:
+    break;
+  }
+
+  if (match)
+    cwc_send_msg(cwc, data, len, 0, 1);
+}
+
+void
+cwc_emm_bulcrypt(cwc_t *cwc, uint8_t *data, int len)
+{
+  int match = 0;
+
+  switch (data[0]) {
+  case 0x82: /* unique */
+  case 0x85: /* unique */
+    match = len >= 10 && memcmp(data + 3, cwc->cwc_ua + 2, 3) == 0;
+    break;
+  case 0x84: /* shared */
+    match = len >= 10 && memcmp(data + 3, cwc->cwc_ua + 2, 2) == 0;
+    break;
+  case 0x8b: /* shared-unknown */
+    match = len >= 10 && memcmp(data + 4, cwc->cwc_ua + 2, 2) == 0;
+    break;
+  case 0x8a: /* global */
+    match = len >= 10 && memcmp(data + 4, cwc->cwc_ua + 2, 1) == 0;
+    break;
+  }
+
+  if (match)
+    cwc_send_msg(cwc, data, len, 0, 1);
+}
 
 /**
  *
  */
 static void
-update_keys(cwc_transport_t *ct)
+update_keys(cwc_service_t *ct)
 {
   int i;
-  ct->ct_pending_cw_update = 0;
+  ct->cs_pending_cw_update = 0;
   for(i = 0; i < 8; i++)
-    if(ct->ct_cw[i]) {
-      set_even_control_word(ct->ct_keys, ct->ct_cw);
+    if(ct->cs_cw[i]) {
+      set_even_control_word(ct->cs_keys, ct->cs_cw);
       break;
     }
   
   for(i = 0; i < 8; i++)
-    if(ct->ct_cw[8 + i]) {
-      set_odd_control_word(ct->ct_keys, ct->ct_cw + 8);
+    if(ct->cs_cw[8 + i]) {
+      set_odd_control_word(ct->cs_keys, ct->cs_cw + 8);
       break;
     }
 }
@@ -1339,102 +1858,102 @@ update_keys(cwc_transport_t *ct)
  *
  */
 static int
-cwc_descramble(th_descrambler_t *td, th_transport_t *t, struct th_stream *st,
+cwc_descramble(th_descrambler_t *td, service_t *t, struct elementary_stream *st,
 	       const uint8_t *tsb)
 {
-  cwc_transport_t *ct = (cwc_transport_t *)td;
+  cwc_service_t *ct = (cwc_service_t *)td;
   int r;
   unsigned char *vec[3];
 
-  if(ct->ct_keystate == CT_FORBIDDEN)
+  if(ct->cs_keystate == CS_FORBIDDEN)
     return 1;
 
-  if(ct->ct_keystate != CT_RESOLVED)
+  if(ct->cs_keystate != CS_RESOLVED)
     return -1;
 
-  if(ct->ct_fill == 0 && ct->ct_pending_cw_update)
+  if(ct->cs_fill == 0 && ct->cs_pending_cw_update)
     update_keys(ct);
 
-  memcpy(ct->ct_tsbcluster + ct->ct_fill * 188, tsb, 188);
-  ct->ct_fill++;
+  memcpy(ct->cs_tsbcluster + ct->cs_fill * 188, tsb, 188);
+  ct->cs_fill++;
 
-  if(ct->ct_fill != ct->ct_cluster_size)
+  if(ct->cs_fill != ct->cs_cluster_size)
     return 0;
 
   while(1) {
 
-    vec[0] = ct->ct_tsbcluster;
-    vec[1] = ct->ct_tsbcluster + ct->ct_fill * 188;
+    vec[0] = ct->cs_tsbcluster;
+    vec[1] = ct->cs_tsbcluster + ct->cs_fill * 188;
     vec[2] = NULL;
     
-    r = decrypt_packets(ct->ct_keys, vec);
+    r = decrypt_packets(ct->cs_keys, vec);
     if(r > 0) {
       int i;
-      const uint8_t *t0 = ct->ct_tsbcluster;
+      const uint8_t *t0 = ct->cs_tsbcluster;
 
       for(i = 0; i < r; i++) {
 	ts_recv_packet2(t, t0);
 	t0 += 188;
       }
 
-      r = ct->ct_fill - r;
+      r = ct->cs_fill - r;
       assert(r >= 0);
 
       if(r > 0)
-	memmove(ct->ct_tsbcluster, t0, r * 188);
-      ct->ct_fill = r;
+	memmove(ct->cs_tsbcluster, t0, r * 188);
+      ct->cs_fill = r;
 
-      if(ct->ct_pending_cw_update && r > 0)
+      if(ct->cs_pending_cw_update && r > 0)
 	continue;
     } else {
-      ct->ct_fill = 0;
+      ct->cs_fill = 0;
     }
     break;
   }
-  if(ct->ct_pending_cw_update)
+  if(ct->cs_pending_cw_update)
     update_keys(ct);
 
   return 0;
 }
 
 /**
- * global_lock is held
- * tht_stream_mutex is held
+ * cwc_mutex is held
+ * s_stream_mutex is held
  */
 static void 
-cwc_transport_destroy(th_descrambler_t *td)
+cwc_service_destroy(th_descrambler_t *td)
 {
-  cwc_transport_t *ct = (cwc_transport_t *)td;
+  cwc_service_t *ct = (cwc_service_t *)td;
   ecm_pid_t *ep;
   int i;
 
-  while((ep = LIST_FIRST(&ct->ct_pids)) != NULL) {
+  while((ep = LIST_FIRST(&ct->cs_pids)) != NULL) {
     for(i = 0; i < 256; i++)
       free(ep->ep_sections[i]);
     LIST_REMOVE(ep, ep_link);
     free(ep);
   }
 
-  LIST_REMOVE(td, td_transport_link);
+  LIST_REMOVE(td, td_service_link);
 
-  LIST_REMOVE(ct, ct_link);
+  LIST_REMOVE(ct, cs_link);
 
-  free_key_struct(ct->ct_keys);
-  free(ct->ct_tsbcluster);
+  free_key_struct(ct->cs_keys);
+  free(ct->cs_tsbcluster);
   free(ct);
 }
 
 /**
  *
  */
-static inline th_stream_t *
-cwc_find_stream_by_caid(th_transport_t *t, int caid)
+static inline elementary_stream_t *
+cwc_find_stream_by_caid(service_t *t, int caid)
 {
-  th_stream_t *st;
+  elementary_stream_t *st;
   caid_t *c;
 
-  TAILQ_FOREACH(st, &t->tht_components, st_link) {
-    LIST_FOREACH(c, &st->st_caids, link) {
+  TAILQ_FOREACH(st, &t->s_components, es_link) {
+    LIST_FOREACH(c, &st->es_caids, link) {
       if(c->caid == caid)
 	return st;
     }
@@ -1446,16 +1965,16 @@ cwc_find_stream_by_caid(th_transport_t *t, int caid)
 /**
  * Check if our CAID's matches, and if so, link
  *
- * global_lock is held
+ * global_lock is held. Not that we care about that, but either way, it is.
  */
 void
-cwc_transport_start(th_transport_t *t)
+cwc_service_start(service_t *t)
 {
   cwc_t *cwc;
-  cwc_transport_t *ct;
+  cwc_service_t *ct;
   th_descrambler_t *td;
 
-  lock_assert(&global_lock);
+  pthread_mutex_lock(&cwc_mutex);
   TAILQ_FOREACH(cwc, &cwcs, cwc_link) {
     if(cwc->cwc_caid == 0)
       continue;
@@ -1463,27 +1982,28 @@ cwc_transport_start(th_transport_t *t)
     if(cwc_find_stream_by_caid(t, cwc->cwc_caid) == NULL)
       continue;
 
-    ct = calloc(1, sizeof(cwc_transport_t));
-    ct->ct_cluster_size = get_suggested_cluster_size();
-    ct->ct_tsbcluster = malloc(ct->ct_cluster_size * 188);
+    ct = calloc(1, sizeof(cwc_service_t));
+    ct->cs_cluster_size = get_suggested_cluster_size();
+    ct->cs_tsbcluster = malloc(ct->cs_cluster_size * 188);
 
-    ct->ct_keys = get_key_struct();
-    ct->ct_cwc = cwc;
-    ct->ct_transport = t;
-    ct->ct_okchannel = -1;
+    ct->cs_keys = get_key_struct();
+    ct->cs_cwc = cwc;
+    ct->cs_service = t;
+    ct->cs_okchannel = -1;
 
-    td = &ct->ct_head;
-    td->td_stop       = cwc_transport_destroy;
+    td = &ct->cs_head;
+    td->td_stop       = cwc_service_destroy;
     td->td_table      = cwc_table_input;
     td->td_descramble = cwc_descramble;
-    LIST_INSERT_HEAD(&t->tht_descramblers, td, td_transport_link);
+    LIST_INSERT_HEAD(&t->s_descramblers, td, td_service_link);
 
-    LIST_INSERT_HEAD(&cwc->cwc_transports, ct, ct_link);
+    LIST_INSERT_HEAD(&cwc->cwc_services, ct, cs_link);
 
     tvhlog(LOG_DEBUG, "cwc", "%s using CWC %s:%d",
-	   transport_nicename(t), cwc->cwc_hostname, cwc->cwc_port);
+	   service_nicename(t), cwc->cwc_hostname, cwc->cwc_port);
 
   }
+  pthread_mutex_unlock(&cwc_mutex);
 }
 
 
@@ -1493,10 +2013,11 @@ cwc_transport_start(th_transport_t *t)
 static void
 cwc_destroy(cwc_t *cwc)
 {
-  lock_assert(&global_lock);
+  pthread_mutex_lock(&cwc_mutex);
   TAILQ_REMOVE(&cwcs, cwc, cwc_link);  
   cwc->cwc_running = 0;
   pthread_cond_signal(&cwc->cwc_cond);
+  pthread_mutex_unlock(&cwc_mutex);
 }
 
 
@@ -1581,6 +2102,7 @@ cwc_record_build(cwc_t *cwc)
   
   htsmsg_add_str(e, "deskey", buf);
   htsmsg_add_u32(e, "emm", cwc->cwc_emm);
+  htsmsg_add_u32(e, "emmex", cwc->cwc_emmex);
   htsmsg_add_str(e, "comment", cwc->cwc_comment ?: "");
 
   return e;
@@ -1621,8 +2143,6 @@ cwc_entry_update(void *opaque, const char *id, htsmsg_t *values, int maycreate)
   if((cwc = cwc_entry_find(id, maycreate)) == NULL)
     return NULL;
 
-  lock_assert(&global_lock);
-  
   if((s = htsmsg_get_str(values, "username")) != NULL) {
     free(cwc->cwc_username);
     cwc->cwc_username = strdup(s);
@@ -1632,7 +2152,7 @@ cwc_entry_update(void *opaque, const char *id, htsmsg_t *values, int maycreate)
     free(cwc->cwc_password);
     free(cwc->cwc_password_salted);
     cwc->cwc_password = strdup(s);
-    cwc->cwc_password_salted = strdup(cwc_krypt(s, "$1$abcdefgh$"));
+    cwc->cwc_password_salted = crypt_md5(s, "$1$abcdefgh$");
   }
 
   if((s = htsmsg_get_str(values, "comment")) != NULL) {
@@ -1668,6 +2188,9 @@ cwc_entry_update(void *opaque, const char *id, htsmsg_t *values, int maycreate)
 
   if(!htsmsg_get_u32(values, "emm", &u32))
     cwc->cwc_emm = u32;
+
+  if(!htsmsg_get_u32(values, "emmex", &u32))
+    cwc->cwc_emmex = u32;
 
   cwc->cwc_reconfigure = 1;
 
@@ -1756,6 +2279,7 @@ static const dtable_class_t cwc_dtc = {
   .dtc_record_delete  = cwc_entry_delete,
   .dtc_read_access = ACCESS_ADMIN,
   .dtc_write_access = ACCESS_ADMIN,
+  .dtc_mutex = &cwc_mutex,
 };
 
 
@@ -1769,9 +2293,141 @@ cwc_init(void)
   dtable_t *dt;
 
   TAILQ_INIT(&cwcs);
-
+  pthread_mutex_init(&cwc_mutex, NULL);
   pthread_cond_init(&cwc_config_changed, NULL);
 
   dt = dtable_create(&cwc_dtc, "cwc", NULL);
   dtable_load(dt);
+}
+
+
+#include <openssl/md5.h>
+
+/*
+ * "THE BEER-WARE LICENSE" (Revision 42):
+ * <phk@login.dknet.dk> wrote this file.  As long as you retain this notice you
+ * can do whatever you want with this stuff. If we meet some day, and you think
+ * this stuff is worth it, you can buy me a beer in return.   Poul-Henning Kamp
+ */
+
+static unsigned char itoa64[] = /* 0 ... 63 => ascii - 64 */
+        "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/* to64 BUFFER VALUE NUM
+ * Write NUM base64 characters of VALUE into BUFFER. */
+static void to64(char *s, unsigned long v, int n)
+{
+    while (--n >= 0) {
+        *s++ = itoa64[v&0x3f];
+        v >>= 6;
+    }
+}
+
+/* crypt_md5 PASSWORD SALT
+ * Poul-Henning Kamp's crypt(3)-alike using MD5. */
+static char *
+crypt_md5(const char *pw, const char *salt)
+{
+    const char *magic = "$1$";
+    /* This string is magic for this algorithm.  Having
+     * it this way, we can get get better later on */
+    char *p;
+    const char *sp,*ep;
+    unsigned char   final[16];
+    int sl,pl,i,j;
+    MD5_CTX ctx,ctx1;
+    unsigned long l;
+
+    /* Refine the Salt first */
+    sp = salt;
+
+    /* If it starts with the magic string, then skip that */
+    if(!strncmp(sp,magic,strlen(magic)))
+        sp += strlen(magic);
+
+    /* It stops at the first '$', max 8 chars */
+    for(ep=sp;*ep && *ep != '$' && ep < (sp+8);ep++)
+        continue;
+
+    /* get the length of the true salt */
+    sl = ep - sp;
+
+    MD5_Init(&ctx);
+
+    /* The password first, since that is what is most unknown */
+    MD5_Update(&ctx,(unsigned char *)pw,strlen(pw));
+
+    /* Then our magic string */
+    MD5_Update(&ctx,(unsigned char *)magic,strlen(magic));
+
+    /* Then the raw salt */
+    MD5_Update(&ctx,(unsigned char *)sp,sl);
+
+    /* Then just as many characters of the MD5_(pw,salt,pw) */
+    MD5_Init(&ctx1);
+    MD5_Update(&ctx1,(unsigned char *)pw,strlen(pw));
+    MD5_Update(&ctx1,(unsigned char *)sp,sl);
+    MD5_Update(&ctx1,(unsigned char *)pw,strlen(pw));
+    MD5_Final(final,&ctx1);
+    for(pl = strlen(pw); pl > 0; pl -= 16)
+        MD5_Update(&ctx,(unsigned char *)final,pl>16 ? 16 : pl);
+
+    /* Don't leave anything around in vm they could use. */
+    memset(final,0,sizeof final);
+
+    /* Then something really weird... */
+    for (j=0,i = strlen(pw); i ; i >>= 1)
+        if(i&1)
+            MD5_Update(&ctx, (unsigned char *)final+j, 1);
+        else
+            MD5_Update(&ctx, (unsigned char *)pw+j, 1);
+
+    /* Now make the output string */
+    char *passwd = malloc(120);
+
+    strcpy(passwd,magic);
+    strncat(passwd,sp,sl);
+    strcat(passwd,"$");
+
+    MD5_Final(final,&ctx);
+
+    /*
+     * and now, just to make sure things don't run too fast
+     * On a 60 Mhz Pentium this takes 34 msec, so you would
+     * need 30 seconds to build a 1000 entry dictionary...
+     */
+    for(i=0;i<1000;i++) {
+        MD5_Init(&ctx1);
+        if(i & 1)
+            MD5_Update(&ctx1,(unsigned char *)pw,strlen(pw));
+        else
+            MD5_Update(&ctx1,(unsigned char *)final,16);
+
+        if(i % 3)
+            MD5_Update(&ctx1,(unsigned char *)sp,sl);
+
+        if(i % 7)
+            MD5_Update(&ctx1,(unsigned char *)pw,strlen(pw));
+
+        if(i & 1)
+            MD5_Update(&ctx1,(unsigned char *)final,16);
+        else
+            MD5_Update(&ctx1,(unsigned char *)pw,strlen(pw));
+        MD5_Final(final,&ctx1);
+    }
+
+    p = passwd + strlen(passwd);
+
+    l = (final[ 0]<<16) | (final[ 6]<<8) | final[12]; to64(p,l,4); p += 4;
+    l = (final[ 1]<<16) | (final[ 7]<<8) | final[13]; to64(p,l,4); p += 4;
+    l = (final[ 2]<<16) | (final[ 8]<<8) | final[14]; to64(p,l,4); p += 4;
+    l = (final[ 3]<<16) | (final[ 9]<<8) | final[15]; to64(p,l,4); p += 4;
+    l = (final[ 4]<<16) | (final[10]<<8) | final[ 5]; to64(p,l,4); p += 4;
+    l =                    final[11]                ; to64(p,l,2); p += 2;
+    *p = '\0';
+
+    /* Don't leave anything around in vm they could use. */
+    memset(final,0,sizeof final);
+
+    return passwd;
 }

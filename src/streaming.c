@@ -18,11 +18,11 @@
 
 #include <string.h>
 
-#include "tvhead.h"
+#include "tvheadend.h"
 #include "streaming.h"
 #include "packet.h"
 #include "atomic.h"
-#include "transports.h"
+#include "service.h"
 
 void
 streaming_pad_init(streaming_pad_t *sp)
@@ -52,7 +52,16 @@ streaming_queue_deliver(void *opauqe, streaming_message_t *sm)
   streaming_queue_t *sq = opauqe;
 
   pthread_mutex_lock(&sq->sq_mutex);
-  TAILQ_INSERT_TAIL(&sq->sq_queue, sm, sm_link);
+
+  /* queue size protection */
+  // TODO: would be better to update size as we go, but this would
+  //       require updates elsewhere to ensure all removals from the queue
+  //       are covered (new function)
+  if (sq->sq_maxsize && streaming_queue_size(&sq->sq_queue) >= sq->sq_maxsize)
+    streaming_msg_free(sm);
+  else
+    TAILQ_INSERT_TAIL(&sq->sq_queue, sm, sm_link);
+
   pthread_cond_signal(&sq->sq_cond);
   pthread_mutex_unlock(&sq->sq_mutex);
 }
@@ -62,13 +71,24 @@ streaming_queue_deliver(void *opauqe, streaming_message_t *sm)
  *
  */
 void
-streaming_queue_init(streaming_queue_t *sq, int reject_filter)
+streaming_queue_init2(streaming_queue_t *sq, int reject_filter, size_t maxsize)
 {
   streaming_target_init(&sq->sq_st, streaming_queue_deliver, sq, reject_filter);
 
   pthread_mutex_init(&sq->sq_mutex, NULL);
   pthread_cond_init(&sq->sq_cond, NULL);
   TAILQ_INIT(&sq->sq_queue);
+
+  sq->sq_maxsize = maxsize;
+}
+
+/**
+ *
+ */
+void
+streaming_queue_init(streaming_queue_t *sq, int reject_filter)
+{
+  streaming_queue_init2(sq, reject_filter, 0); // 0 = unlimited
 }
 
 
@@ -182,8 +202,13 @@ streaming_msg_clone(streaming_message_t *src)
     atomic_add(&ss->ss_refcount, 1);
     break;
 
+  case SMT_SIGNAL_STATUS:
+    dst->sm_data = malloc(sizeof(signal_status_t));
+    memcpy(dst->sm_data, src->sm_data, sizeof(signal_status_t));
+    break;
+
   case SMT_STOP:
-  case SMT_TRANSPORT_STATUS:
+  case SMT_SERVICE_STATUS:
   case SMT_NOSTART:
     dst->sm_code = src->sm_code;
     break;
@@ -192,8 +217,8 @@ streaming_msg_clone(streaming_message_t *src)
     break;
 
   case SMT_MPEGTS:
-    dst->sm_data = malloc(188);
-    memcpy(dst->sm_data, src->sm_data, 188);
+    pktbuf_ref_inc(src->sm_data);
+    dst->sm_data = src->sm_data;
     break;
 
   default:
@@ -214,7 +239,7 @@ streaming_start_unref(streaming_start_t *ss)
   if((atomic_add(&ss->ss_refcount, -1)) != 1)
     return;
 
-  transport_source_info_free(&ss->ss_si);
+  service_source_info_free(&ss->ss_si);
   for(i = 0; i < ss->ss_num_components; i++)
     if(ss->ss_components[i].ssc_gh)
       pktbuf_ref_dec(ss->ss_components[i].ssc_gh);
@@ -244,14 +269,19 @@ streaming_msg_free(streaming_message_t *sm)
   case SMT_EXIT:
     break;
 
-  case SMT_TRANSPORT_STATUS:
+  case SMT_SERVICE_STATUS:
     break;
 
   case SMT_NOSTART:
     break;
 
-  case SMT_MPEGTS:
+  case SMT_SIGNAL_STATUS:
     free(sm->sm_data);
+    break;
+
+  case SMT_MPEGTS:
+    if(sm->sm_data)
+      pktbuf_ref_dec(sm->sm_data);
     break;
 
   default:
@@ -324,6 +354,36 @@ streaming_queue_clear(struct streaming_message_queue *q)
 /**
  *
  */
+size_t streaming_queue_size(struct streaming_message_queue *q)
+{
+  streaming_message_t *sm;
+  int size = 0;
+
+  TAILQ_FOREACH(sm, q, sm_link) {
+    if (sm->sm_type == SMT_PACKET)
+    {
+      th_pkt_t *pkt = sm->sm_data;
+      if (pkt && pkt->pkt_payload)
+      {
+        size += pkt->pkt_payload->pb_size;
+      }
+    }
+    else if (sm->sm_type == SMT_MPEGTS)
+    {
+      pktbuf_t *pkt_payload = sm->sm_data;
+      if (pkt_payload)
+      {
+        size += pkt_payload->pb_size;
+      }
+    }
+  }
+  return size;
+}
+
+
+/**
+ *
+ */
 const char *
 streaming_code2txt(int code)
 {
@@ -333,7 +393,7 @@ streaming_code2txt(int code)
   case SM_CODE_OK: return "OK";
     
   case SM_CODE_SOURCE_RECONFIGURED:
-    return "Soruce reconfigured";
+    return "Source reconfigured";
   case SM_CODE_BAD_SOURCE:
     return "Source quality is bad";
   case SM_CODE_SOURCE_DELETED:
@@ -355,8 +415,8 @@ streaming_code2txt(int code)
     return "Too bad signal quality";
   case SM_CODE_NO_SOURCE:
     return "No source available";
-  case SM_CODE_NO_TRANSPORT:
-    return "No transport assigned to channel";
+  case SM_CODE_NO_SERVICE:
+    return "No service assigned to channel";
 
   case SM_CODE_ABORTED:
     return "Aborted by user";
@@ -388,7 +448,7 @@ streaming_start_copy(const streaming_start_t *src)
   streaming_start_t *dst = malloc(siz);
   
   memcpy(dst, src, siz);
-  transport_source_info_copy(&dst->ss_si, &src->ss_si);
+  service_source_info_copy(&dst->ss_si, &src->ss_si);
 
   for(i = 0; i < dst->ss_num_components; i++) {
     streaming_start_component_t *ssc = &dst->ss_components[i];
